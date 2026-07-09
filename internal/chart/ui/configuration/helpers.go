@@ -3,6 +3,7 @@ package configuration
 import (
 	"fmt"
 
+	"github.com/flamingo-stack/openframe-cli/internal/chart/utils/config"
 	"github.com/flamingo-stack/openframe-cli/internal/chart/utils/types"
 	"github.com/pterm/pterm"
 )
@@ -14,7 +15,7 @@ func (w *ConfigurationWizard) loadBaseValues() (*types.ChartConfiguration, error
 		return nil, err
 	}
 
-	baseFilePath := "helm-values.yaml"
+	baseFilePath := config.DefaultHelmValuesFile
 
 	return &types.ChartConfiguration{
 		BaseHelmValuesPath: baseFilePath,
@@ -53,14 +54,6 @@ func (w *ConfigurationWizard) ShowConfigurationSummary(config *types.ChartConfig
 
 	for _, section := range config.ModifiedSections {
 		switch section {
-		case "deployment":
-			if config.DeploymentMode != nil {
-				pterm.Success.Printf("✓ Deployment mode: %s\n", string(*config.DeploymentMode))
-			}
-		case "saas":
-			if config.SaaSConfig != nil {
-				pterm.Success.Printf("✓ SaaS repository password configured\n")
-			}
 		case "branch":
 			if config.Branch != nil {
 				pterm.Success.Printf("✓ Branch updated: %s\n", *config.Branch)

@@ -36,7 +36,7 @@ func TestConfigurationWizard_ConfigureWithExistingFile(t *testing.T) {
 
 	// Create temporary directory with existing helm values file
 	tmpDir := t.TempDir()
-	helmValuesPath := filepath.Join(tmpDir, "helm-values.yaml")
+	helmValuesPath := filepath.Join(tmpDir, "openframe-helm-values.yaml")
 
 	existingYAML := `global:
   repoBranch: develop
@@ -72,7 +72,7 @@ func TestConfigurationWizard_Integration_LoadAndApply(t *testing.T) {
 
 	// Create temporary directory with existing helm values
 	tmpDir := t.TempDir()
-	helmValuesPath := filepath.Join(tmpDir, "helm-values.yaml")
+	helmValuesPath := filepath.Join(tmpDir, "openframe-helm-values.yaml")
 
 	originalYAML := `repository:
   branch: main
@@ -95,10 +95,8 @@ registry:
 
 	// Create configuration with changes for OSS deployment
 	newBranch := "develop"
-	deploymentMode := types.DeploymentModeOSS
 	config := &types.ChartConfiguration{
-		Branch:         &newBranch,
-		DeploymentMode: &deploymentMode,
+		Branch: &newBranch,
 		DockerRegistry: &types.DockerRegistryConfig{
 			Username: "newuser",
 			Password: "newpass",
@@ -136,28 +134,8 @@ registry:
 }
 
 func TestConfigurationWizard_DeploymentModes(t *testing.T) {
-	tests := []struct {
-		name     string
-		mode     types.DeploymentMode
-		expected string
-	}{
-		{
-			name:     "OSS deployment mode",
-			mode:     types.DeploymentModeOSS,
-			expected: "oss",
-		},
-		{
-			name:     "SaaS deployment mode",
-			mode:     types.DeploymentModeSaaS,
-			expected: "saas",
-		},
-	}
-
-	for _, tt := range tests {
-		t.Run(tt.name, func(t *testing.T) {
-			assert.Equal(t, tt.expected, string(tt.mode))
-		})
-	}
+	// Only the OSS (oss-tenant) deployment mode is supported.
+	assert.Equal(t, "oss", string(types.DeploymentModeOSS))
 }
 
 func TestConfigurationWizard_LoadBaseValues(t *testing.T) {
@@ -167,7 +145,7 @@ func TestConfigurationWizard_LoadBaseValues(t *testing.T) {
 	config, err := wizard.loadBaseValues()
 	assert.NoError(t, err)
 	assert.NotNil(t, config)
-	assert.Equal(t, "helm-values.yaml", config.BaseHelmValuesPath)
+	assert.Equal(t, "openframe-helm-values.yaml", config.BaseHelmValuesPath)
 	assert.Empty(t, config.TempHelmValuesPath)
 	assert.NotNil(t, config.ExistingValues)
 	assert.Empty(t, config.ModifiedSections)

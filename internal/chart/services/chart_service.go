@@ -19,7 +19,7 @@ import (
 	sharedErrors "github.com/flamingo-stack/openframe-cli/internal/shared/errors"
 	"github.com/flamingo-stack/openframe-cli/internal/shared/executor"
 	"github.com/flamingo-stack/openframe-cli/internal/shared/files"
-	"github.com/flamingo-stack/openframe-cli/internal/shared/redact"
+	sharedUI "github.com/flamingo-stack/openframe-cli/internal/shared/ui"
 	"github.com/pterm/pterm"
 	"k8s.io/client-go/rest"
 )
@@ -175,33 +175,22 @@ func (w *InstallationWorkflow) ExecuteWithContext(parentCtx context.Context, req
 		}
 		pterm.Info.Println("Using existing configuration (dry-run mode)")
 	} else if req.NonInteractive {
-		// Mode 1: FULLY NON-INTERACTIVE (CI/CD)
-		if req.DeploymentMode == "" {
-			return fmt.Errorf("--deployment-mode is required when using --non-interactive")
-		}
-		pterm.Warning.Printf("Running in non-interactive mode with %s deployment\n", req.DeploymentMode)
+		// NON-INTERACTIVE (CI/CD): use the existing openframe-helm-values.yaml as-is.
+		pterm.Info.Println("Running in non-interactive mode using existing openframe-helm-values.yaml")
 		var err error
-		chartConfig, err = w.loadExistingConfiguration(req.DeploymentMode)
+		chartConfig, err = w.loadExistingConfiguration()
 		if err != nil {
 			return fmt.Errorf("non-interactive configuration failed: %w", err)
 		}
-	} else if req.DeploymentMode != "" {
-		// Mode 2: PARTIAL NON-INTERACTIVE (Skip deployment selection only)
-		pterm.Warning.Printf("Deployment mode pre-selected: %s\n", req.DeploymentMode)
-		var err error
-		chartConfig, err = w.runPartialConfigurationWizard(req.DeploymentMode)
-		if err != nil {
-			return fmt.Errorf("configuration wizard failed: %w", err)
-		}
-
-		// Register temporary file for cleanup
+		// Register the temp values file for cleanup (the dry-run and interactive
+		// paths do the same); otherwise the OS temp dir accumulates one per run.
 		if chartConfig.TempHelmValuesPath != "" {
 			if backupErr := w.fileCleanup.RegisterTempFile(chartConfig.TempHelmValuesPath); backupErr != nil {
 				pterm.Warning.Printf("Failed to register temp file for cleanup: %v\n", backupErr)
 			}
 		}
 	} else {
-		// Mode 3: FULLY INTERACTIVE (existing behavior)
+		// FULLY INTERACTIVE (existing behavior)
 		var err error
 		chartConfig, err = w.runConfigurationWizard()
 		if err != nil {
@@ -217,24 +206,31 @@ func (w *InstallationWorkflow) ExecuteWithContext(parentCtx context.Context, req
 	}
 
 	// Step 2: Select cluster
-	clusterName, err := w.selectCluster(req.Args, req.Verbose)
-	if err != nil || clusterName == "" {
+	clusterName, err := w.selectCluster(req.Args, req.NonInteractive, req.Verbose)
+	if err != nil {
 		return err
 	}
+	if clusterName == "" {
+		// selectCluster prints why (no clusters found, or the interactive
+		// selection was cancelled) but returns no error; surface a non-zero exit
+		// so callers and CI don't read a no-op install as success.
+		return fmt.Errorf("no cluster selected — nothing was installed")
+	}
 
-	// Step 3: Confirm installation on the selected cluster (skip in non-interactive mode)
-	if !req.NonInteractive {
+	// Step 3: Confirm installation (skipped in non-interactive and dry-run modes)
+	if !req.NonInteractive && !req.DryRun {
 		if !w.confirmInstallationOnCluster(clusterName) {
 			pterm.Info.Println("Installation cancelled.")
 			return fmt.Errorf("installation cancelled by user")
 		}
 	}
 
-	// Step 4: Regenerate certificates after configuration and cluster selection
-	// Skip certificate regeneration in non-interactive mode
-	if !req.NonInteractive {
+	// Step 4: Regenerate certificates (skipped in non-interactive and dry-run modes)
+	if !req.NonInteractive && !req.DryRun {
 		// Non-fatal: failures are logged inside the method, continue regardless.
 		_ = w.regenerateCertificates()
+	} else if req.DryRun {
+		pterm.Info.Println("Skipping certificate regeneration (dry-run)")
 	} else {
 		pterm.Warning.Println("Skipping certificate regeneration (non-interactive mode)")
 	}
@@ -300,22 +296,15 @@ func (w *InstallationWorkflow) ExecuteWithContextDeferred(parentCtx context.Cont
 		}
 		pterm.Info.Println("Using existing configuration (dry-run mode)")
 	} else if req.NonInteractive {
-		if req.DeploymentMode == "" {
-			return fmt.Errorf("--deployment-mode is required when using --non-interactive")
-		}
-		pterm.Warning.Printf("Running in non-interactive mode with %s deployment\n", req.DeploymentMode)
+		// NON-INTERACTIVE (CI/CD): use the existing openframe-helm-values.yaml as-is.
+		pterm.Info.Println("Running in non-interactive mode using existing openframe-helm-values.yaml")
 		var err error
-		chartConfig, err = w.loadExistingConfiguration(req.DeploymentMode)
+		chartConfig, err = w.loadExistingConfiguration()
 		if err != nil {
 			return fmt.Errorf("non-interactive configuration failed: %w", err)
 		}
-	} else if req.DeploymentMode != "" {
-		pterm.Warning.Printf("Deployment mode pre-selected: %s\n", req.DeploymentMode)
-		var err error
-		chartConfig, err = w.runPartialConfigurationWizard(req.DeploymentMode)
-		if err != nil {
-			return fmt.Errorf("configuration wizard failed: %w", err)
-		}
+		// Register the temp values file for cleanup (the dry-run and interactive
+		// paths do the same); otherwise the OS temp dir accumulates one per run.
 		if chartConfig.TempHelmValuesPath != "" {
 			if backupErr := w.fileCleanup.RegisterTempFile(chartConfig.TempHelmValuesPath); backupErr != nil {
 				pterm.Warning.Printf("Failed to register temp file for cleanup: %v\n", backupErr)
@@ -335,9 +324,15 @@ func (w *InstallationWorkflow) ExecuteWithContextDeferred(parentCtx context.Cont
 	}
 
 	// Step 2: Select cluster
-	clusterName, err := w.selectCluster(req.Args, req.Verbose)
-	if err != nil || clusterName == "" {
+	clusterName, err := w.selectCluster(req.Args, req.NonInteractive, req.Verbose)
+	if err != nil {
 		return err
+	}
+	if clusterName == "" {
+		// selectCluster prints why (no clusters found, or the interactive
+		// selection was cancelled) but returns no error; surface a non-zero exit
+		// so callers and CI don't read a no-op install as success.
+		return fmt.Errorf("no cluster selected — nothing was installed")
 	}
 
 	// Step 2.5: Get KubeConfig for the selected cluster and initialize HelmManager.
@@ -351,18 +346,20 @@ func (w *InstallationWorkflow) ExecuteWithContextDeferred(parentCtx context.Cont
 		return fmt.Errorf("failed to initialize HelmManager: %w", err)
 	}
 
-	// Step 3: Confirm installation on the selected cluster (skip in non-interactive mode)
-	if !req.NonInteractive {
+	// Step 3: Confirm installation (skipped in non-interactive and dry-run modes)
+	if !req.NonInteractive && !req.DryRun {
 		if !w.confirmInstallationOnCluster(clusterName) {
 			pterm.Info.Println("Installation cancelled.")
 			return fmt.Errorf("installation cancelled by user")
 		}
 	}
 
-	// Step 4: Regenerate certificates
-	if !req.NonInteractive {
+	// Step 4: Regenerate certificates (skipped in non-interactive and dry-run modes)
+	if !req.NonInteractive && !req.DryRun {
 		// Non-fatal: failures are logged inside the method, continue regardless.
 		_ = w.regenerateCertificates()
+	} else if req.DryRun {
+		pterm.Info.Println("Skipping certificate regeneration (dry-run)")
 	} else {
 		pterm.Warning.Println("Skipping certificate regeneration (non-interactive mode)")
 	}
@@ -398,9 +395,9 @@ func (w *InstallationWorkflow) ExecuteWithContextDeferred(parentCtx context.Cont
 }
 
 // selectCluster handles cluster selection
-func (w *InstallationWorkflow) selectCluster(args []string, verbose bool) (string, error) {
+func (w *InstallationWorkflow) selectCluster(args []string, nonInteractive, verbose bool) (string, error) {
 	clusterSelector := NewClusterSelector(w.clusterService, w.chartService.operationsUI)
-	return clusterSelector.SelectCluster(args, verbose)
+	return clusterSelector.SelectCluster(args, nonInteractive, verbose)
 }
 
 // confirmInstallationOnCluster prompts for user confirmation with specific cluster name
@@ -433,7 +430,7 @@ func (w *InstallationWorkflow) runConfigurationWizard() (*types.ChartConfigurati
 	return config, nil
 }
 
-// loadExistingConfiguration loads existing helm-values.yaml for non-interactive mode
+// loadExistingConfiguration loads existing openframe-helm-values.yaml for non-interactive mode
 // dryRunConfiguration builds the chart configuration for a dry-run. Like every
 // other mode, it writes the base helm values to a real temporary file and
 // points TempHelmValuesPath at it — previously dry-run set a fixed
@@ -451,71 +448,36 @@ func (w *InstallationWorkflow) dryRunConfiguration() (*types.ChartConfiguration,
 		return nil, fmt.Errorf("failed to create temporary values file for dry-run: %w", err)
 	}
 	return &types.ChartConfiguration{
-		BaseHelmValuesPath: "helm-values.yaml",
+		BaseHelmValuesPath: config.DefaultHelmValuesFile,
 		TempHelmValuesPath: tempFilePath,
 		ExistingValues:     baseValues,
 		ModifiedSections:   make([]string, 0),
 	}, nil
 }
 
-func (w *InstallationWorkflow) loadExistingConfiguration(deploymentModeStr string) (*types.ChartConfiguration, error) {
+func (w *InstallationWorkflow) loadExistingConfiguration() (*types.ChartConfiguration, error) {
 	modifier := templates.NewHelmValuesModifier()
 
-	// Load existing helm-values.yaml
+	// Load existing openframe-helm-values.yaml
 	values, err := modifier.LoadOrCreateBaseValues()
 	if err != nil {
-		return nil, fmt.Errorf("failed to load helm-values.yaml: %w", err)
+		return nil, fmt.Errorf("failed to load openframe-helm-values.yaml: %w", err)
 	}
 
-	// Convert string to DeploymentMode
-	var deploymentMode types.DeploymentMode
-	switch deploymentModeStr {
-	case "oss-tenant":
-		deploymentMode = types.DeploymentModeOSS
-	case "saas-tenant":
-		deploymentMode = types.DeploymentModeSaaS
-	case "saas-shared":
-		deploymentMode = types.DeploymentModeSaaSShared
-	default:
-		return nil, fmt.Errorf("invalid deployment mode: %s", deploymentModeStr)
-	}
-
-	// Auto-configure the specified deployment mode using existing HelmValuesModifier
-	// Only set the deployment mode - let existing logic handle branches and passwords
-	if err := modifier.ApplyConfiguration(values, &types.ChartConfiguration{
-		DeploymentMode: &deploymentMode,
-	}); err != nil {
-		return nil, fmt.Errorf("failed to auto-configure deployment mode: %w", err)
-	}
-
-	// Create temporary file with modified values (same as interactive mode)
+	// Create temporary file from the existing values (same as interactive mode)
 	tempFilePath, err := modifier.CreateTemporaryValuesFile(values)
 	if err != nil {
 		return nil, fmt.Errorf("failed to create temporary values file: %w", err)
 	}
 
-	// Extract SaaS repository password from helm values for SaaS modes (both Shared and Tenant)
-	var saasConfig *types.SaaSConfig
-	if deploymentMode == types.DeploymentModeSaaSShared || deploymentMode == types.DeploymentModeSaaS {
-		repositoryPassword := modifier.GetSaaSRepositoryPassword(values)
-		if repositoryPassword == "" {
-			return nil, fmt.Errorf("repository password not found in helm-values.yaml under deployment.saas.repository.password")
-		}
-		saasConfig = &types.SaaSConfig{
-			RepositoryPassword: repositoryPassword,
-		}
-	}
-
 	result := &types.ChartConfiguration{
-		BaseHelmValuesPath: "helm-values.yaml",
+		BaseHelmValuesPath: config.DefaultHelmValuesFile,
 		TempHelmValuesPath: tempFilePath, // Use temporary file like interactive mode
 		ExistingValues:     values,
-		DeploymentMode:     &deploymentMode,
-		SaaSConfig:         saasConfig,
 		ModifiedSections:   []string{},
 	}
 
-	// Validate required configuration exists (after auto-configuration)
+	// Validate the OSS configuration (no-op today: OSS uses a public repo).
 	validator := NewConfigurationValidator()
 	if err := validator.ValidateConfiguration(result); err != nil {
 		return nil, fmt.Errorf("configuration validation failed: %w", err)
@@ -524,51 +486,13 @@ func (w *InstallationWorkflow) loadExistingConfiguration(deploymentModeStr strin
 	return result, nil
 }
 
-// runPartialConfigurationWizard runs wizard with pre-selected deployment mode
-func (w *InstallationWorkflow) runPartialConfigurationWizard(deploymentModeStr string) (*types.ChartConfiguration, error) {
-	// Convert string to DeploymentMode
-	var deploymentMode types.DeploymentMode
-	switch deploymentModeStr {
-	case "oss-tenant":
-		deploymentMode = types.DeploymentModeOSS
-	case "saas-tenant":
-		deploymentMode = types.DeploymentModeSaaS
-	case "saas-shared":
-		deploymentMode = types.DeploymentModeSaaSShared
-	default:
-		return nil, fmt.Errorf("invalid deployment mode: %s", deploymentModeStr)
-	}
-
-	wizard := configuration.NewConfigurationWizard()
-	return wizard.ConfigureHelmValuesWithMode(deploymentMode)
-}
-
 // buildConfiguration constructs the installation configuration
 func (w *InstallationWorkflow) buildConfiguration(req types.InstallationRequest, clusterName string, chartConfig *types.ChartConfiguration) (config.ChartInstallConfig, error) {
 	configBuilder := config.NewBuilder(w.chartService.operationsUI)
 
-	// Determine repository URL based on deployment mode
+	// Only the OSS (oss-tenant) deployment is supported: use the request's repo
+	// (defaults to the public OSS repository) with no embedded credentials.
 	githubRepo := req.GitHubRepo
-	if chartConfig.DeploymentMode != nil {
-		// Always use deployment mode to determine repository URL if deployment mode is specified
-		// This ensures that SaaS Shared mode gets the correct repository
-		githubRepo = types.GetRepositoryURL(*chartConfig.DeploymentMode)
-
-		// Inject authentication token for private SaaS repositories (both Shared and Tenant)
-		if (*chartConfig.DeploymentMode == types.DeploymentModeSaaSShared || *chartConfig.DeploymentMode == types.DeploymentModeSaaS) && chartConfig.SaaSConfig != nil && chartConfig.SaaSConfig.RepositoryPassword != "" {
-			// Register the token so it is scrubbed from any verbose/debug command logging.
-			redact.RegisterSecret(chartConfig.SaaSConfig.RepositoryPassword)
-			// Replace https:// with https://x-access-token:TOKEN@
-			// This format is required for GitHub PAT authentication in non-interactive mode
-			githubRepo = strings.Replace(githubRepo, "https://", "https://"+git.GitTokenUser+":"+chartConfig.SaaSConfig.RepositoryPassword+"@", 1)
-		}
-	}
-
-	// Convert deployment mode to string for builder
-	var deploymentModeStr string
-	if chartConfig.DeploymentMode != nil {
-		deploymentModeStr = string(*chartConfig.DeploymentMode)
-	}
 
 	// When the operator explicitly pins a ref (--ref/--github-branch), write it into
 	// the temp helm-values' repository.branch BEFORE the builder reads it back. This
@@ -585,7 +509,7 @@ func (w *InstallationWorkflow) buildConfiguration(req types.InstallationRequest,
 			}
 			values = loaded
 		}
-		modifier.SetRepositoryBranch(values, deploymentModeStr, ref)
+		modifier.SetRepositoryBranch(values, ref)
 		if werr := modifier.WriteValues(values, chartConfig.TempHelmValuesPath); werr != nil {
 			return config.ChartInstallConfig{}, fmt.Errorf("pinning ref %q into helm values: %w", ref, werr)
 		}
@@ -596,7 +520,6 @@ func (w *InstallationWorkflow) buildConfiguration(req types.InstallationRequest,
 		req.Force, req.DryRun, req.Verbose, req.NonInteractive, clusterName,
 		githubRepo, req.GitHubBranch, req.CertDir,
 		chartConfig.TempHelmValuesPath,
-		deploymentModeStr,
 	)
 }
 
@@ -655,9 +578,11 @@ func InstallChartsWithConfigContext(ctx context.Context, req types.InstallationR
 	default:
 	}
 
-	// Check prerequisites first
+	// Check prerequisites first. Treat a non-TTY environment as non-interactive
+	// even without the flag, so CI never blocks on a Y/N prompt (this is the only
+	// prerequisite gate now — the app command group no longer runs a second one).
 	installer := prerequisites.NewInstaller()
-	if err := installer.CheckAndInstallNonInteractive(req.NonInteractive); err != nil {
+	if err := installer.CheckAndInstallNonInteractive(req.NonInteractive || sharedUI.IsNonInteractive()); err != nil {
 		return err
 	}
 

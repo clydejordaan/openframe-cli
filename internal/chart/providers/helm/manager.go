@@ -167,8 +167,14 @@ func (h *HelmManager) IsChartInstalled(ctx context.Context, releaseName, namespa
 // UninstallRelease removes a Helm release from a namespace. Missing releases are
 // treated as success (--ignore-not-found). kubeContext, when non-empty, targets
 // a specific kube-context (matching how installs pin the context).
+//
+// No --wait: the release owns ArgoCD Application CRs that carry ArgoCD's
+// resources-finalizer, so --wait would block until every child workload is
+// pruned — and hang for good once ArgoCD itself is being removed and can no
+// longer clear the finalizer. Deletion is triggered fire-and-forget; the
+// uninstall flow strips any leftover finalizers afterwards.
 func (h *HelmManager) UninstallRelease(ctx context.Context, releaseName, namespace, kubeContext string) error {
-	args := []string{"uninstall", releaseName, "-n", namespace, "--ignore-not-found", "--wait"}
+	args := []string{"uninstall", releaseName, "-n", namespace, "--ignore-not-found"}
 	if kubeContext != "" {
 		args = append(args, "--kube-context", kubeContext)
 	}
@@ -200,7 +206,10 @@ func argoCDInstallArgs(cfg config.ChartInstallConfig, valuesFilePath string) []s
 		args = append(args, "--kube-context", k8s.ResolveContextForCluster(k8s.DefaultKubeconfigPath(), cfg.ClusterName))
 	}
 	if cfg.DryRun {
-		args = append(args, "--dry-run")
+		// Explicit client-side dry-run: the bare --dry-run form is deprecated in
+		// Helm 3 and client mode needs no cluster round-trip (no false negatives
+		// from server-side validation of pre-existing resources).
+		args = append(args, "--dry-run=client")
 	}
 	return args
 }
@@ -519,8 +528,7 @@ func (h *HelmManager) InstallAppOfAppsFromLocal(ctx context.Context, config conf
 		if _, err := os.Stat(certFile); err == nil {
 			if _, err := os.Stat(keyFile); err == nil {
 				args = append(args,
-					// Localhost ingress TLS. The chart flattened this from
-					// deployment.oss/saas.ingress.localhost.tls to a single
+					// Localhost ingress TLS at the flattened
 					// deployment.ingress.localhost.tls (cert/key fields, WSL paths for Helm).
 					"--set-file", fmt.Sprintf("deployment.ingress.localhost.tls.cert=%s", certFilePath),
 					"--set-file", fmt.Sprintf("deployment.ingress.localhost.tls.key=%s", keyFilePath),
@@ -536,7 +544,8 @@ func (h *HelmManager) InstallAppOfAppsFromLocal(ctx context.Context, config conf
 	}
 
 	if config.DryRun {
-		args = append(args, "--dry-run")
+		// Client-side dry-run (bare --dry-run is deprecated in Helm 3).
+		args = append(args, "--dry-run=client")
 	}
 
 	// Execute helm command with local chart path

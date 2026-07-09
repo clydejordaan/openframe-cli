@@ -1,30 +1,10 @@
 package types
 
 import (
-	"fmt"
-	"strings"
 	"time"
 
 	"github.com/flamingo-stack/openframe-cli/internal/chart/models"
 )
-
-// ValidDeploymentModes are the accepted --deployment-mode flag values.
-var ValidDeploymentModes = []string{"oss-tenant", "saas-tenant", "saas-shared"}
-
-// ValidateDeploymentMode returns an error if mode is non-empty and not one of
-// the accepted deployment modes. An empty mode is allowed (interactive selection
-// or defaulting).
-func ValidateDeploymentMode(mode string) error {
-	if mode == "" {
-		return nil
-	}
-	for _, m := range ValidDeploymentModes {
-		if mode == m {
-			return nil
-		}
-	}
-	return fmt.Errorf("invalid deployment mode: %s. Valid options: %s", mode, strings.Join(ValidDeploymentModes, ", "))
-}
 
 // DockerRegistryConfig holds Docker registry settings
 type DockerRegistryConfig struct {
@@ -33,13 +13,12 @@ type DockerRegistryConfig struct {
 	Email    string
 }
 
-// DeploymentMode represents the deployment mode (OSS, SaaS, or SaaS Shared)
+// DeploymentMode represents the deployment mode. The CLI supports only the
+// OSS (oss-tenant) deployment; the type is retained as a single-valued enum.
 type DeploymentMode string
 
 const (
-	DeploymentModeOSS        DeploymentMode = "oss"
-	DeploymentModeSaaS       DeploymentMode = "saas"
-	DeploymentModeSaaSShared DeploymentMode = "saas-shared"
+	DeploymentModeOSS DeploymentMode = "oss"
 )
 
 // IngressType represents the type of ingress to use
@@ -67,13 +46,6 @@ type NgrokConfig struct {
 	RegistrationStartTime time.Time `json:"registrationStartTime,omitempty"`
 }
 
-// SaaSConfig holds SaaS-specific configuration
-type SaaSConfig struct {
-	RepositoryPassword string `json:"repositoryPassword"`
-	SaaSBranch         string `json:"saasBranch"`
-	OSSBranch          string `json:"ossBranch"`
-}
-
 // IngressConfig holds ingress configuration options
 type IngressConfig struct {
 	Type        IngressType  `json:"type"`
@@ -97,28 +69,17 @@ var NgrokRegistrationURLs = struct { // #nosec G101 -- public ngrok documentatio
 
 // ChartConfiguration holds all configurable options for chart installation
 type ChartConfiguration struct {
-	BaseHelmValuesPath string                 // Path to the original helm-values.yaml (read-only)
+	BaseHelmValuesPath string                 // Path to the original openframe-helm-values.yaml (read-only)
 	TempHelmValuesPath string                 // Path to the temporary helm values file for installation
 	ExistingValues     map[string]interface{} // Current values from the file
 	ModifiedSections   []string               // Track which sections were modified
-	DeploymentMode     *DeploymentMode        // nil means use existing, otherwise use this value
 	Branch             *string                // nil means use existing, otherwise use this value
 	DockerRegistry     *DockerRegistryConfig  // nil means use existing, otherwise use this value
 	IngressConfig      *IngressConfig         // nil means use existing, otherwise use this value
-	SaaSConfig         *SaaSConfig            // nil means use existing, otherwise use this value
 }
 
-// GetRepositoryURL returns the appropriate repository URL based on deployment mode
-func GetRepositoryURL(mode DeploymentMode) string {
-	switch mode {
-	case DeploymentModeSaaSShared:
-		return models.RepoSaaSShared
-	case DeploymentModeSaaS:
-		return models.RepoSaaSTenant
-	case DeploymentModeOSS:
-		return models.RepoOSSTenant
-	default:
-		// Default to OSS repository
-		return models.RepoOSSTenant
-	}
+// GetRepositoryURL returns the platform repository URL. Only the OSS (oss-tenant)
+// deployment is supported, so this always returns the public OSS repository.
+func GetRepositoryURL() string {
+	return models.RepoOSSTenant
 }

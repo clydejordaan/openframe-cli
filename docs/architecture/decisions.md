@@ -33,24 +33,18 @@ cluster without installing anything.
 
 ---
 
-## D2 — `deployment-mode` configures the app, not the cluster
+## D2 — OSS-tenant is the only deployment
 
-`--deployment-mode` has three values: `oss-tenant`, `saas-tenant`, `saas-shared`.
+The CLI supports a single deployment: **oss-tenant**. The app is always installed
+from the public `openframe-oss-tenant` chart repository, which requires no
+credentials. There is no `--deployment-mode` flag; `--non-interactive` simply
+reuses the existing `openframe-helm-values.yaml`.
 
-The mode selects **which Helm chart repository** the app is installed from and
-**whether credentials are required** — it does **not** create a different kind of
-cluster:
+| deployment   | chart repository                | credentials |
+|--------------|---------------------------------|-------------|
+| `oss-tenant` | `openframe-oss-tenant` (public) | none        |
 
-| mode | chart repository | credentials |
-|------|------------------|-------------|
-| `oss-tenant` | `openframe-oss-tenant` (public) | none |
-| `saas-tenant` | `openframe-saas-tenant` | required |
-| `saas-shared` | `openframe-saas-shared` | required |
-
-This matches the existing behavior: today the cluster is always a local k3d
-cluster regardless of mode, and only the chart install consumes the mode. The
-mode lives with the **app** command. (At the orchestration layer — see D4 —
-mode may also influence *where* a cluster is created: OSS → local, SaaS → cloud.)
+The cluster is always a local k3d cluster.
 
 ---
 
@@ -63,8 +57,7 @@ mode may also influence *where* a cluster is created: OSS → local, SaaS → cl
   the OpenFrame app on an existing, online cluster. `upgrade` re-deploys the
   app-of-apps at a new git ref (`--ref`) or forces an ArgoCD hard refresh + sync
   (`--sync`); `access` prints the ArgoCD admin credentials and how to open the
-  UI. (`app` was previously `chart`; `chart` remains a hidden alias for
-  backward compatibility.)
+  UI. (`app` was previously named `chart`.)
 - `openframe prerequisites check|install [cluster|app]` — the prerequisite
   checks/installs as first-class commands.
 - `openframe update` — self-update of the CLI binary (checksum + cosign verified,
@@ -75,17 +68,16 @@ mode may also influence *where* a cluster is created: OSS → local, SaaS → cl
 
 ## D4 — `bootstrap` is a thin orchestrator
 
-`openframe bootstrap [name] --deployment-mode=… [--non-interactive] [--verbose]`
-stays as a single, beginner-friendly command. Internally it only orchestrates:
+`openframe bootstrap [name] [--non-interactive] [--verbose]` stays as a single,
+beginner-friendly command. Internally it only orchestrates:
 
-```
+```text
 prerequisites → cluster create → app install
 ```
 
 It contains no business logic of its own — everything lives in the primitives.
-The command and its flags are unchanged for users; in particular
-`openframe bootstrap --deployment-mode=oss-tenant --non-interactive` keeps
-working exactly as before (this is a hard contract during the restructure).
+`openframe bootstrap --non-interactive` reuses the existing `openframe-helm-values.yaml`
+for the OSS tenant deployment.
 
 ---
 
@@ -132,10 +124,10 @@ rather than raw errors.
 
 ## Target layout
 
-```
+```text
 cmd/
   cluster/         create, delete, list, status, cleanup
-  app/             install, upgrade, status, access, uninstall   (alias: chart)
+  app/             install, upgrade, status, access, uninstall
   prerequisites/   check, install
   bootstrap/       orchestrator (prerequisites → cluster create → app install)
   update/          self-update: (update), check, rollback
