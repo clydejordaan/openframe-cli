@@ -45,15 +45,6 @@ func NewK3dManager(exec executor.CommandExecutor, verbose bool) *K3dManager {
 	}
 }
 
-// NewK3dManagerWithTimeout creates a new K3D cluster manager with custom timeout
-func NewK3dManagerWithTimeout(exec executor.CommandExecutor, verbose bool, timeout string) *K3dManager {
-	return &K3dManager{
-		executor: exec,
-		verbose:  verbose,
-		timeout:  timeout,
-	}
-}
-
 // CreateCluster creates a new K3D cluster using config file approach
 // Returns the *rest.Config for the created cluster that can be used to interact with it
 func (m *K3dManager) CreateCluster(ctx context.Context, config models.ClusterConfig) (*rest.Config, error) {
@@ -74,23 +65,8 @@ func (m *K3dManager) CreateCluster(ctx context.Context, config models.ClusterCon
 		// Don't fail - cluster might still work if limits are already sufficient
 	}
 
-	// On Windows/WSL2, get the WSL internal IP before creating the cluster
-	// to include it as a TLS SAN in the k3s certificate
-	var wslInternalIP string
-	if runtime.GOOS == "windows" {
-		var err error
-		wslInternalIP, err = m.getWSLInternalIP(ctx)
-		if err != nil {
-			if m.verbose {
-				fmt.Printf("Warning: Could not get WSL internal IP for TLS SAN: %v\n", err)
-			}
-			// Continue without the extra SAN - the insecure TLS config will still work
-		} else if m.verbose {
-			fmt.Printf("✓ Retrieved WSL internal IP for TLS SAN: %s\n", wslInternalIP)
-		}
-	}
-
-	configFile, err := m.createK3dConfigFile(config, wslInternalIP)
+	// No Windows branch: the CLI forwards into WSL and runs as linux (see wsllauncher).
+	configFile, err := m.createK3dConfigFile(config)
 	if err != nil {
 		return nil, models.NewClusterOperationError("create", config.Name, fmt.Errorf("failed to create config file: %w", err))
 	}
@@ -118,21 +94,10 @@ func (m *K3dManager) CreateCluster(ctx context.Context, config models.ClusterCon
 		// Don't fail - this is not critical
 	}
 
-	// Convert Windows path to WSL path if running on Windows
-	configFilePath := configFile
-	if runtime.GOOS == "windows" {
-		configFilePath, err = m.convertWindowsPathToWSL(configFile)
-		if err != nil {
-			return nil, models.NewClusterOperationError("create", config.Name, fmt.Errorf("failed to convert config file path for WSL: %w", err))
-		}
-		if m.verbose {
-			fmt.Printf("DEBUG: Converted Windows path '%s' to WSL path '%s'\n", configFile, configFilePath)
-		}
-	}
-
+	// No Windows branch: the CLI forwards into WSL and runs as linux (see wsllauncher).
 	args := []string{
 		"cluster", "create",
-		"--config", configFilePath,
+		"--config", configFile,
 		"--timeout", m.timeout,
 		"--kubeconfig-update-default", // Update default kubeconfig with new cluster context
 		"--kubeconfig-switch-context", // Automatically switch to new cluster context
@@ -163,15 +128,7 @@ func (m *K3dManager) CreateCluster(ctx context.Context, config models.ClusterCon
 		// Don't fail - this is not critical
 	}
 
-	// On Windows, rewrite the kubeconfig server address to use the WSL internal IP
-	// This is necessary for helm (running inside Ubuntu WSL) to reach the k3d cluster
-	if err := m.rewriteWSLKubeconfigServerAddress(ctx, config.Name); err != nil {
-		if m.verbose {
-			fmt.Printf("Warning: Could not rewrite kubeconfig server address: %v\n", err)
-		}
-		// Don't fail - helm might still work if the network is configured correctly
-	}
-
+	// No Windows branch: the CLI forwards into WSL and runs as linux (see wsllauncher).
 	// Verify the cluster is reachable and get the rest.Config via the native
 	// client (client-go). This is the sole verification — the previous best-effort
 	// kubectl double-check was removed with the kubectl migration.
@@ -191,8 +148,13 @@ func (m *K3dManager) GetRestConfig(ctx context.Context, clusterName string) (*re
 
 // DeleteCluster removes a K3D cluster
 func (m *K3dManager) DeleteCluster(ctx context.Context, name string, clusterType models.ClusterType, force bool) error {
-	if name == "" {
-		return models.NewInvalidConfigError("name", name, "cluster name cannot be empty")
+	// Validate at this domain boundary, not just at `cluster create`/`bootstrap`:
+	// `cluster delete <name> --force` skips both the existence check and any
+	// command-layer validation, and the name then flows into the Docker cleanup
+	// fallback. ValidateClusterName restricts names to [a-zA-Z0-9-] (no shell
+	// metacharacters) as defense in depth against a name reaching a shell.
+	if err := models.ValidateClusterName(name); err != nil {
+		return models.NewInvalidConfigError("name", name, err.Error())
 	}
 
 	if clusterType != models.ClusterTypeK3d {
@@ -213,9 +175,10 @@ func (m *K3dManager) DeleteCluster(ctx context.Context, name string, clusterType
 
 	_, err := m.executor.ExecuteWithOptions(ctx, options)
 	if err != nil {
-		// On Windows/WSL or when force is set, fall back to direct Docker cleanup
-		// This handles WSL networking issues that can cause k3d to hang or fail
-		if runtime.GOOS == "windows" || force {
+		// When force is set, fall back to direct Docker cleanup.
+		// This handles networking issues that can cause k3d to hang or fail.
+		// No Windows branch: the CLI forwards into WSL and runs as linux (see wsllauncher).
+		if force {
 			if m.verbose {
 				fmt.Printf("k3d delete failed, attempting direct Docker cleanup for cluster %s: %v\n", name, err)
 			}
@@ -236,44 +199,21 @@ func (m *K3dManager) DeleteCluster(ctx context.Context, name string, clusterType
 }
 
 // forceCleanupDockerContainers removes all Docker containers associated with a k3d cluster
-// This is a fallback mechanism when k3d cluster delete fails (e.g., due to WSL networking issues)
+// This is a fallback mechanism when k3d cluster delete fails.
+//
+// No Windows branch: the CLI forwards into WSL and runs as linux (see wsllauncher).
 func (m *K3dManager) forceCleanupDockerContainers(ctx context.Context, clusterName string) error {
-	if runtime.GOOS == "windows" {
-		return m.forceCleanupDockerContainersWSL(ctx, clusterName)
-	}
-	return m.forceCleanupDockerContainersDirect(ctx, clusterName)
-}
-
-// forceCleanupDockerContainersWSL removes k3d containers via WSL on Windows
-func (m *K3dManager) forceCleanupDockerContainersWSL(ctx context.Context, clusterName string) error {
-	username, err := m.getWSLUser(ctx)
-	if err != nil {
-		username = "runner" // fallback to runner
+	// Defense in depth: the cluster name is interpolated into Docker arguments
+	// here. Callers validate, but re-check so a future caller cannot introduce
+	// an injection. See DeleteCluster.
+	if err := models.ValidateClusterName(clusterName); err != nil {
+		return models.NewInvalidConfigError("name", clusterName, err.Error())
 	}
 
-	// Remove containers matching k3d-<clustername> pattern
-	cleanupCmd := fmt.Sprintf(
-		"sudo docker ps -aq --filter 'name=k3d-%s' | xargs -r sudo docker rm -f 2>/dev/null || true",
-		clusterName,
-	)
-	_, err = m.executor.Execute(ctx, "wsl", "-d", "Ubuntu", "-u", username, "bash", "-c", cleanupCmd)
-	if err != nil {
-		return fmt.Errorf("failed to cleanup containers via WSL: %w", err)
-	}
-
-	// Also remove the network
-	networkCleanupCmd := fmt.Sprintf("sudo docker network rm k3d-%s 2>/dev/null || true", clusterName)
-	if _, nerr := m.executor.Execute(ctx, "wsl", "-d", "Ubuntu", "-u", username, "bash", "-c", networkCleanupCmd); nerr != nil && m.verbose {
-		fmt.Printf("Warning: failed to remove k3d network for %s: %v\n", clusterName, nerr)
-	}
-
-	return nil
-}
-
-// forceCleanupDockerContainersDirect removes k3d containers directly (non-Windows)
-func (m *K3dManager) forceCleanupDockerContainersDirect(ctx context.Context, clusterName string) error {
-	// List containers matching k3d-<clustername> pattern
-	result, err := m.executor.Execute(ctx, "docker", "ps", "-aq", "--filter", fmt.Sprintf("name=k3d-%s", clusterName))
+	// Select containers by the k3d.cluster label (exact match). A name= filter
+	// is an unanchored regex: deleting cluster "dev" would also match the
+	// containers of "dev-2", "dev-old", ... (T0-2).
+	result, err := m.executor.Execute(ctx, "docker", "ps", "-aq", "--filter", fmt.Sprintf("label=k3d.cluster=%s", clusterName))
 	if err != nil {
 		return fmt.Errorf("failed to list containers: %w", err)
 	}
@@ -355,12 +295,14 @@ func (m *K3dManager) ListClusters(ctx context.Context) ([]models.ClusterInfo, er
 		}
 
 		clusters = append(clusters, models.ClusterInfo{
-			Name:      k3dCluster.Name,
-			Type:      models.ClusterTypeK3d,
-			Status:    fmt.Sprintf("%d/%d", k3dCluster.ServersRunning, k3dCluster.ServersCount),
-			NodeCount: k3dCluster.AgentsCount + k3dCluster.ServersCount,
-			CreatedAt: createdAt,
-			Nodes:     []models.NodeInfo{},
+			Name:         k3dCluster.Name,
+			Type:         models.ClusterTypeK3d,
+			Status:       fmt.Sprintf("%d/%d", k3dCluster.ServersRunning, k3dCluster.ServersCount),
+			ReadyServers: k3dCluster.ServersRunning,
+			TotalServers: k3dCluster.ServersCount,
+			NodeCount:    k3dCluster.AgentsCount + k3dCluster.ServersCount,
+			CreatedAt:    createdAt,
+			Nodes:        []models.NodeInfo{},
 		})
 	}
 
@@ -444,8 +386,7 @@ func (m *K3dManager) validateClusterConfig(config models.ClusterConfig) error {
 }
 
 // createK3dConfigFile creates a k3d config file
-// wslInternalIP is optional - if provided, it will be added as a TLS SAN for the k3s API server certificate
-func (m *K3dManager) createK3dConfigFile(config models.ClusterConfig, wslInternalIP string) (string, error) {
+func (m *K3dManager) createK3dConfigFile(config models.ClusterConfig) (string, error) {
 	image := defaultK3sImage
 	if runtime.GOARCH == "arm64" {
 		image = defaultK3sImage
@@ -477,25 +418,9 @@ image: %s`, config.Name, servers, agents, image)
 	httpPort := strconv.Itoa(ports.HTTP)
 	httpsPort := strconv.Itoa(ports.HTTPS)
 
-	// On Windows/WSL2, bind to 0.0.0.0 so the API is accessible via the WSL eth0 IP
-	// Docker runs inside WSL2 Ubuntu, and binding to 0.0.0.0 makes the API accessible:
-	// - From within WSL via 127.0.0.1 (for kubectl/helm running in WSL)
-	// - From Windows via WSL's eth0 IP (for the Go client running on Windows)
+	// No Windows branch: the CLI forwards into WSL and runs as linux (see wsllauncher),
+	// so the API always binds to the loopback address.
 	hostIP := "127.0.0.1"
-	if runtime.GOOS == "windows" {
-		hostIP = "0.0.0.0"
-	}
-
-	// Build TLS SAN argument if WSL internal IP is provided
-	// This ensures the k3s API server certificate includes the WSL internal IP,
-	// allowing kubectl/helm to connect via the WSL network without TLS errors
-	tlsSanArg := ""
-	if wslInternalIP != "" {
-		tlsSanArg = fmt.Sprintf(`
-      - arg: --tls-san=%s
-        nodeFilters:
-          - server:*`, wslInternalIP)
-	}
 
 	configContent += fmt.Sprintf(`
 kubeAPI:
@@ -513,14 +438,14 @@ options:
           - all
       - arg: --kubelet-arg=eviction-soft=
         nodeFilters:
-          - all%s
+          - all
 ports:
   - port: %s:80
     nodeFilters:
       - loadbalancer
   - port: %s:443
     nodeFilters:
-      - loadbalancer`, hostIP, hostIP, apiPort, tlsSanArg, httpPort, httpsPort)
+      - loadbalancer`, hostIP, hostIP, apiPort, httpPort, httpsPort)
 
 	tmpFile, err := os.CreateTemp("", "k3d-config-*.yaml")
 	if err != nil {
@@ -553,16 +478,32 @@ func CreateClusterManagerWithExecutor(exec executor.CommandExecutor) *K3dManager
 // The limits are set via sysctl:
 // - fs.inotify.max_user_watches: max number of file watches per user (default: 8192)
 // - fs.inotify.max_user_instances: max number of inotify instances per user (default: 128)
+//
+// Best-effort by design, and it must NEVER prompt: sudo runs with -n
+// (non-interactive) so a box without passwordless sudo gets a skip + hint, not
+// a hidden password prompt on /dev/tty that stalls `bootstrap --non-interactive`
+// mid-spinner.
 func (m *K3dManager) increaseInotifyLimits(ctx context.Context) error {
-	// Desired limits - these are common recommended values for development environments
-	const maxUserWatches = "524288"
-	const maxUserInstances = "512"
+	return m.increaseInotifyLimitsFor(ctx, runtime.GOOS)
+}
 
-	if runtime.GOOS == "windows" {
-		// On Windows, the limits need to be set inside WSL2 where Docker runs
-		// We need root privileges to modify sysctl settings
+// increaseInotifyLimitsFor is the goos-parameterized implementation (testable
+// off-Linux).
+func (m *K3dManager) increaseInotifyLimitsFor(ctx context.Context, goos string) error {
+	// Desired limits - these are common recommended values for development environments
+	const maxUserWatches = 524288
+	const maxUserInstances = 512
+
+	switch goos {
+	case "darwin":
+		// macOS has no fs.inotify.* keys (it uses FSEvents); the old
+		// unconditional `sudo sysctl` only ever produced a password prompt here.
+		return nil
+	case "windows":
+		// On Windows, the limits need to be set inside WSL2 where Docker runs.
+		// Reached only with WSL forwarding disabled; keep it prompt-free too.
 		sysctlCmd := fmt.Sprintf(
-			"sudo sysctl -w fs.inotify.max_user_watches=%s fs.inotify.max_user_instances=%s 2>/dev/null || true",
+			"sudo -n sysctl -w fs.inotify.max_user_watches=%d fs.inotify.max_user_instances=%d 2>/dev/null || true",
 			maxUserWatches, maxUserInstances,
 		)
 
@@ -572,27 +513,54 @@ func (m *K3dManager) increaseInotifyLimits(ctx context.Context) error {
 		}
 
 		if m.verbose {
-			fmt.Printf("✓ Increased inotify limits in WSL (max_user_watches=%s, max_user_instances=%s)\n",
+			fmt.Printf("✓ Increased inotify limits in WSL (max_user_watches=%d, max_user_instances=%d)\n",
 				maxUserWatches, maxUserInstances)
 		}
-	} else {
-		// On Linux/macOS, set the limits directly
-		// Note: macOS doesn't use inotify (uses FSEvents), so this only applies to Linux
-		sysctlCmd := fmt.Sprintf(
-			"sudo sysctl -w fs.inotify.max_user_watches=%s fs.inotify.max_user_instances=%s 2>/dev/null || true",
-			maxUserWatches, maxUserInstances,
-		)
+	default: // linux
+		// Skip the privileged write when the current limits already suffice.
+		if m.inotifyLimitsSufficient(ctx, maxUserWatches, maxUserInstances) {
+			if m.verbose {
+				fmt.Println("✓ inotify limits already sufficient")
+			}
+			return nil
+		}
 
-		_, err := m.executor.Execute(ctx, "bash", "-c", sysctlCmd)
+		// sudo -n: fail instead of prompting when passwordless sudo is missing.
+		_, err := m.executor.Execute(ctx, "sudo", "-n", "sysctl", "-w",
+			fmt.Sprintf("fs.inotify.max_user_watches=%d", maxUserWatches),
+			fmt.Sprintf("fs.inotify.max_user_instances=%d", maxUserInstances),
+		)
 		if err != nil {
-			return fmt.Errorf("failed to set inotify limits: %w", err)
+			// Best-effort: the caller downgrades this to a warning. Give the
+			// manual command since we deliberately refused to prompt for sudo.
+			return fmt.Errorf("could not raise inotify limits without prompting for sudo; run manually: sudo sysctl -w fs.inotify.max_user_watches=%d fs.inotify.max_user_instances=%d: %w",
+				maxUserWatches, maxUserInstances, err)
 		}
 
 		if m.verbose {
-			fmt.Printf("✓ Increased inotify limits (max_user_watches=%s, max_user_instances=%s)\n",
+			fmt.Printf("✓ Increased inotify limits (max_user_watches=%d, max_user_instances=%d)\n",
 				maxUserWatches, maxUserInstances)
 		}
 	}
 
 	return nil
+}
+
+// inotifyLimitsSufficient reports whether both current inotify limits already
+// meet the wanted values (reading them needs no privileges).
+func (m *K3dManager) inotifyLimitsSufficient(ctx context.Context, wantWatches, wantInstances int) bool {
+	for key, want := range map[string]int{
+		"fs.inotify.max_user_watches":   wantWatches,
+		"fs.inotify.max_user_instances": wantInstances,
+	} {
+		result, err := m.executor.Execute(ctx, "sysctl", "-n", key)
+		if err != nil {
+			return false
+		}
+		current, err := strconv.Atoi(strings.TrimSpace(result.Stdout))
+		if err != nil || current < want {
+			return false
+		}
+	}
+	return true
 }

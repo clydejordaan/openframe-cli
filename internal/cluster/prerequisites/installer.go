@@ -2,7 +2,6 @@ package prerequisites
 
 import (
 	"fmt"
-	"os/exec"
 	"runtime"
 	"strings"
 
@@ -23,39 +22,6 @@ func NewInstaller() *Installer {
 	return &Installer{
 		checker: NewPrerequisiteChecker(),
 	}
-}
-
-func (i *Installer) InstallMissingPrerequisites() error {
-	allPresent, missing := i.checker.CheckAll()
-	if allPresent {
-		pterm.Success.Println("All prerequisites are already installed.")
-		return nil
-	}
-
-	pterm.Info.Printf("Starting installation of %d tool(s): %s\n", len(missing), strings.Join(missing, ", "))
-
-	for idx, tool := range missing {
-		// Create a spinner for the installation process
-		sp := spinner.New()
-		sp.Start(fmt.Sprintf("[%d/%d] Installing %s...", idx+1, len(missing), tool))
-
-		if err := i.installTool(tool); err != nil {
-			sp.Fail(fmt.Sprintf("Failed to install %s: %v", tool, err))
-			return fmt.Errorf("failed to install %s: %w", tool, err)
-		}
-
-		sp.Success(fmt.Sprintf("%s installed successfully", tool))
-	}
-
-	// Verify all tools are now installed
-	allPresent, stillMissing := i.checker.CheckAll()
-	if !allPresent {
-		pterm.Warning.Printf("Some tools are still missing: %s\n", strings.Join(stillMissing, ", "))
-		return fmt.Errorf("installation completed but some tools are still missing: %s", strings.Join(stillMissing, ", "))
-	}
-
-	pterm.Success.Println("All prerequisites installed successfully!")
-	return nil
 }
 
 func (i *Installer) installSpecificTools(tools []string) error {
@@ -102,6 +68,16 @@ func (i *Installer) installSpecificTools(tools []string) error {
 	return nil
 }
 
+// containsTool reports whether tools contains name (case-insensitive).
+func containsTool(tools []string, name string) bool {
+	for _, t := range tools {
+		if strings.EqualFold(t, name) {
+			return true
+		}
+	}
+	return false
+}
+
 func (i *Installer) installTool(tool string) error {
 	switch strings.ToLower(tool) {
 	case "docker":
@@ -116,24 +92,6 @@ func (i *Installer) installTool(tool string) error {
 	default:
 		return fmt.Errorf("unknown tool: %s", tool)
 	}
-}
-
-func (i *Installer) runCommand(name string, args ...string) error {
-	// Handle shell commands with pipes
-	if strings.Contains(strings.Join(args, " "), "|") {
-		fullCmd := name + " " + strings.Join(args, " ")
-		cmd := exec.Command("bash", "-c", fullCmd) // #nosec G204 -- shell string built from constant/program-derived values, not untrusted input
-		// Completely silence output during installation
-		return cmd.Run()
-	}
-
-	cmd := exec.Command(name, args...) // #nosec G204 -- explicit argv, no shell; command and args are internal, not untrusted input
-	// Completely silence output during installation
-	return cmd.Run()
-}
-
-func (i *Installer) CheckAndInstall() error {
-	return i.CheckAndInstallNonInteractive(false)
 }
 
 // CheckAndInstallNonInteractive checks and installs prerequisites with optional non-interactive mode
@@ -183,15 +141,20 @@ func (i *Installer) CheckAndInstallNonInteractive(nonInteractive bool) error {
 
 		if confirmed {
 			if err := i.installSpecificTools(missingTools); err != nil {
-				// In non-interactive mode, log error but continue
-				if nonInteractive {
-					pterm.Warning.Printf("Failed to install some prerequisites: %v\n", err)
-					pterm.Info.Println("Continuing anyway (non-interactive mode)...")
-				} else {
-					return err
-				}
-			} else {
-				pterm.Success.Println("All missing tools installed successfully!")
+				// Fail fast in BOTH modes. The old non-interactive path logged
+				// "Continuing anyway" and proceeded to a guaranteed, confusingly
+				// attributed k3d/helm failure minutes later — CI cannot fix
+				// anything "later" anyway.
+				return err
+			}
+			pterm.Success.Println("All missing tools installed successfully!")
+
+			// A freshly installed Docker is not usable yet: Docker Desktop on
+			// macOS takes tens of seconds to start, and on Linux the daemon may
+			// not be running at all. Route it through the start/wait phase below
+			// instead of letting the very next `k3d cluster create` fail.
+			if containsTool(missingTools, "Docker") && !docker.IsDockerRunning() {
+				dockerNotRunning = true
 			}
 		} else {
 			i.showManualInstructions()
@@ -207,19 +170,18 @@ func (i *Installer) CheckAndInstallNonInteractive(nonInteractive bool) error {
 			pterm.Info.Println("Attempting to start Docker automatically (non-interactive mode)...")
 
 			if err := docker.StartDocker(); err != nil {
-				pterm.Warning.Printf("Could not start Docker automatically: %v\n", err)
-				pterm.Info.Println("Docker must be started manually. Continuing anyway...")
-				// Don't exit in non-interactive mode, let it fail later if needed
-				return nil
+				// Fail fast: "continuing anyway" only moved the failure into the
+				// next cluster operation with a misleading error.
+				i.showDockerStartInstructions()
+				return fmt.Errorf("the Docker daemon is not running and could not be started automatically (if it was just installed on Linux, a re-login may be needed for docker group membership): %w", err)
 			}
 
 			sp := spinner.New()
 			sp.Start("Waiting for Docker to start...")
 			if err := docker.WaitForDocker(); err != nil {
-				sp.Warning("Docker failed to start automatically")
-				pterm.Info.Println("Please ensure Docker is running before cluster operations.")
-				// Don't exit in non-interactive mode
-				return nil
+				sp.Fail("Docker failed to start")
+				i.showDockerStartInstructions()
+				return fmt.Errorf("timed out waiting for Docker to start (if it was just installed on Linux, a re-login may be needed for docker group membership): %w", err)
 			}
 			sp.Success("Docker started successfully")
 		} else {

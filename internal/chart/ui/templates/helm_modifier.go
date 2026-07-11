@@ -6,6 +6,7 @@ import (
 
 	"github.com/flamingo-stack/openframe-cli/internal/chart/utils/config"
 	"github.com/flamingo-stack/openframe-cli/internal/chart/utils/types"
+	"github.com/flamingo-stack/openframe-cli/internal/shared/redact"
 	"gopkg.in/yaml.v3"
 )
 
@@ -41,7 +42,39 @@ func (h *HelmValuesModifier) LoadExistingValues(helmValuesPath string) (map[stri
 		values = make(map[string]interface{})
 	}
 
+	// Every load is a credential-collection point: the file may carry the
+	// docker registry password and ngrok tokens.
+	RegisterValueSecrets(values)
+
 	return values, nil
+}
+
+// RegisterValueSecrets registers the sensitive fields of a values map (docker
+// registry password, ngrok API key / authtoken) with the shared redactor, so
+// they can never appear in verbose command logs or command-error output no
+// matter which code path echoes them (audit B5: RegisterSecret had zero call
+// sites, leaving the exact-match half of the redaction system inert).
+func RegisterValueSecrets(values map[string]interface{}) {
+	if registry, ok := values["registry"].(map[string]interface{}); ok {
+		if docker, ok := registry["docker"].(map[string]interface{}); ok {
+			if p, ok := docker["password"].(string); ok {
+				redact.RegisterSecret(p)
+			}
+		}
+	}
+	if deployment, ok := values["deployment"].(map[string]interface{}); ok {
+		if ingress, ok := deployment["ingress"].(map[string]interface{}); ok {
+			if ngrok, ok := ingress["ngrok"].(map[string]interface{}); ok {
+				if credentials, ok := ngrok["credentials"].(map[string]interface{}); ok {
+					for _, key := range []string{"apiKey", "authtoken"} {
+						if v, ok := credentials[key].(string); ok {
+							redact.RegisterSecret(v)
+						}
+					}
+				}
+			}
+		}
+	}
 }
 
 // LoadOrCreateBaseValues loads helm values from current directory or creates default if missing
@@ -147,21 +180,6 @@ func (h *HelmValuesModifier) WriteValues(values map[string]interface{}, helmValu
 	}
 
 	return nil
-}
-
-// GetCurrentBranch extracts the current branch from Helm values (legacy method)
-func (h *HelmValuesModifier) GetCurrentBranch(values map[string]interface{}) string {
-	// First check for deployment-specific branch
-	if branch := h.GetCurrentOSSBranch(values); branch != "main" {
-		return branch
-	}
-	// Fall back to legacy global setting
-	if global, ok := values["global"].(map[string]interface{}); ok {
-		if branch, ok := global["repoBranch"].(string); ok {
-			return branch
-		}
-	}
-	return "main" // default fallback
 }
 
 // GetCurrentOSSBranch extracts the current repository branch from the top-level

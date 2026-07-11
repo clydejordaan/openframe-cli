@@ -49,9 +49,18 @@ openframe app access                         # print ArgoCD URL, admin creds, po
 openframe app uninstall -y                   # remove the deployment
 ```
 
-Key `app install` flags: `--github-repo`, `--github-branch`, `--ref/-r`, `--context/-c`, `--cert-dir`, `--non-interactive`, `--dry-run`, `--force/-f`.
+Key `app install` flags: `--github-repo`, `--ref/-r`, `--context/-c`, `--cert-dir`, `--non-interactive`, `--dry-run`, `--force/-f`.
 
 `app install` deploys the OpenFrame platform app-of-apps — it does not install arbitrary charts.
+
+> **Ref pinning caveat:** `--ref` pins the git ref for the app-of-apps clone
+> and every child Application's `targetRevision`. The root `argocd-apps`
+> Application itself, however, keeps the ref it was installed from — changes
+> to the app-of-apps chart *itself* on a feature ref are applied at install
+> time but are not self-tracked by ArgoCD afterwards. During an upgrade the
+> platform briefly passes through a mixed-ref window while children roll over;
+> applications with `autoSync` disabled are synced automatically by the CLI
+> when progress stalls (or run `openframe app upgrade --sync`).
 
 ## Access ArgoCD
 

@@ -23,24 +23,21 @@ func NewBuilder(operationsUI *chartUI.OperationsUI) *Builder {
 	}
 }
 
-// HelmValues represents the structure of the Helm values file
-type HelmValues struct {
-	Deployment struct {
-		OSS struct {
-			Enabled    bool `yaml:"enabled"`
-			Repository struct {
-				Branch string `yaml:"branch"`
-			} `yaml:"repository"`
-		} `yaml:"oss"`
-	} `yaml:"deployment"`
+// helmValues is the subset of the FLATTENED chart schema this builder consumes:
+// the app-of-apps source ref lives at top-level repository.branch — the same key
+// HelmValuesModifier writes (SetRepositoryBranch) and the chart itself reads.
+// This struct is the single source of truth for branch resolution. The old
+// nested deployment.oss.repository.branch schema is deliberately gone: reading
+// it here ignored the branch the rest of the pipeline used and let stale
+// legacy-schema files silently override an explicit --ref (audit F1/T1-1).
+type helmValues struct {
+	Repository struct {
+		Branch string `yaml:"branch"`
+	} `yaml:"repository"`
 }
 
-// getBranchFromHelmValues reads the Helm values file and extracts the OSS branch
-func (b *Builder) getBranchFromHelmValues() string {
-	return b.getBranchFromHelmValuesPath("")
-}
-
-// getBranchFromHelmValuesPath reads a specific Helm values file and extracts the OSS repository branch
+// getBranchFromHelmValuesPath reads a specific Helm values file and extracts the
+// flattened repository.branch (empty means "use the default/flag ref").
 func (b *Builder) getBranchFromHelmValuesPath(helmValuesPath string) string {
 	if helmValuesPath == "" {
 		pathResolver := NewPathResolver()
@@ -54,57 +51,14 @@ func (b *Builder) getBranchFromHelmValuesPath(helmValuesPath string) string {
 		return ""
 	}
 
-	var values HelmValues
+	var values helmValues
 	err = yaml.Unmarshal(data, &values)
 	if err != nil {
 		// If we can't parse the YAML, return empty string (will use default)
 		return ""
 	}
 
-	if values.Deployment.OSS.Repository.Branch != "" {
-		return values.Deployment.OSS.Repository.Branch
-	}
-
-	return "" // Return empty string if no branch found
-}
-
-// BuildInstallConfig constructs the installation configuration
-func (b *Builder) BuildInstallConfig(
-	force, dryRun, verbose bool,
-	clusterName, githubRepo, githubBranch, certDir string,
-) (ChartInstallConfig, error) {
-	// Use config service for certificate directory
-	if certDir == "" {
-		certDir = b.configService.GetCertificateDirectory()
-	}
-
-	// Create app-of-apps configuration if GitHub repo is provided
-	var appOfAppsConfig *models.AppOfAppsConfig
-	if githubRepo != "" {
-		appOfAppsConfig = models.NewAppOfAppsConfig()
-		appOfAppsConfig.GitHubRepo = githubRepo
-		appOfAppsConfig.GitHubBranch = githubBranch
-		appOfAppsConfig.CertDir = certDir
-
-		// Repository is public, no credentials needed
-
-		// After credentials are provided, check for branch override from Helm values
-		helmBranch := b.getBranchFromHelmValues()
-		if helmBranch != "" {
-			if verbose {
-				pterm.Info.Printf("📥 Using branch '%s' from Helm values\n", helmBranch)
-			}
-			appOfAppsConfig.GitHubBranch = helmBranch
-		} else if verbose {
-			pterm.Info.Printf("📥 Using default branch '%s'\n", appOfAppsConfig.GitHubBranch)
-		}
-	}
-
-	return b.configService.BuildInstallConfig(
-		force, dryRun, verbose,
-		clusterName,
-		appOfAppsConfig,
-	), nil
+	return values.Repository.Branch
 }
 
 // BuildInstallConfigWithCustomHelmPath constructs the installation configuration using a custom helm values file
@@ -133,7 +87,10 @@ func (b *Builder) BuildInstallConfigWithCustomHelmPath(
 		}
 
 		// Check for a branch override from the custom Helm values path
-		// (OSS Tenant: deployment.oss.repository.branch).
+		// (flattened schema: top-level repository.branch). When --ref was
+		// explicit, buildConfiguration already pinned it into this file, so
+		// reading it back here keeps the clone and the child Applications'
+		// targetRevision on the same ref.
 		helmBranch := b.getBranchFromHelmValuesPath(helmValuesPath)
 		if helmBranch != "" {
 			if verbose {

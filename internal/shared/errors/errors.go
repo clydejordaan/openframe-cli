@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"strings"
 
+	"github.com/flamingo-stack/openframe-cli/internal/shared/executor"
 	"github.com/pterm/pterm"
 )
 
@@ -23,24 +24,14 @@ func (e *ValidationError) Error() string {
 	return fmt.Sprintf("validation failed for %s: %s", e.Field, e.Message)
 }
 
-// CommandError represents command execution errors
-type CommandError struct {
-	Command string
-	Args    []string
-	Err     error
-}
+// NOTE: there is deliberately no CommandError type here. There used to be one,
+// with a polished handler — but nothing ever constructed it, so real command
+// failures (executor.CommandError) fell through to the generic error dump. The
+// handler now matches the type the executor actually returns.
 
 // AlreadyHandledError wraps errors that have already been displayed to the user
 type AlreadyHandledError struct {
 	OriginalError error
-}
-
-func (e *CommandError) Error() string {
-	return fmt.Sprintf("command '%s %v' failed: %v", e.Command, e.Args, e.Err)
-}
-
-func (e *CommandError) Unwrap() error {
-	return e.Err
 }
 
 func (e *AlreadyHandledError) Error() string {
@@ -68,13 +59,13 @@ func (eh *ErrorHandler) HandleError(err error) {
 	}
 
 	var validationErr *ValidationError
-	var commandErr *CommandError
+	var commandErr *executor.CommandError
 	var branchErr *BranchNotFoundError
 	switch {
 	case stderrors.As(err, &validationErr):
 		eh.handleValidationError(validationErr)
 	case stderrors.As(err, &commandErr):
-		eh.handleCommandError(commandErr)
+		eh.handleCommandError(commandErr, err)
 	case stderrors.As(err, &branchErr):
 		eh.handleBranchNotFoundError(branchErr)
 	default:
@@ -91,22 +82,41 @@ func (eh *ErrorHandler) handleValidationError(err *ValidationError) {
 	pterm.Printf("  Issue: %s\n", err.Message)
 }
 
-func (eh *ErrorHandler) handleCommandError(err *CommandError) {
-	pterm.Error.Printf("❌ Command execution failed\n")
-	pterm.Printf("  Command: %s\n", pterm.Yellow(err.Command))
-	if len(err.Args) > 0 {
-		pterm.Printf("  Arguments: %v\n", err.Args)
+// handleCommandError renders a failed external command: what ran, how it
+// failed, and — crucially — what the child process actually said. Before this,
+// the handler matched a errors.CommandError type that was never constructed
+// anywhere, so real failures (executor.CommandError) fell through to the
+// generic dump and the user saw "exit status 1" with no reason.
+//
+// outer is the full error chain, used for the friendly hint (which matches on
+// wrapper text such as "cluster create operation failed").
+func (eh *ErrorHandler) handleCommandError(err *executor.CommandError, outer error) {
+	// DefaultBasicText, not bare pterm.Printf: the latter writes straight to
+	// stdout, bypassing --silent redirection (and any test capture).
+	pterm.Error.Printf("Command failed\n")
+	pterm.DefaultBasicText.Printf("  Command:   %s\n", pterm.Yellow(err.Command))
+	pterm.DefaultBasicText.Printf("  Exit code: %d\n", err.ExitCode)
+
+	if reason := strings.TrimSpace(err.Stderr); reason != "" {
+		pterm.DefaultBasicText.Printf("  Output:\n")
+		for _, line := range strings.Split(reason, "\n") {
+			pterm.DefaultBasicText.Printf("    %s\n", pterm.Red(line))
+		}
+	} else {
+		pterm.DefaultBasicText.Printf("  Error:     %v\n", err)
 	}
 
-	if eh.verbose {
-		pterm.Printf("  Details: %v\n", err.Err)
-	} else {
-		pterm.Printf("  Error: %v\n", err.Err)
+	if hint := friendlyHint(outer); hint != "" {
+		pterm.Info.Printf("%s\n", hint)
 	}
 }
 
+// handleBranchNotFoundError names the ref that could not be found. The advice
+// alone ("check if the branch name is correct") was useless when the ref came
+// from a config file or a default rather than from something the user typed.
 func (eh *ErrorHandler) handleBranchNotFoundError(err *BranchNotFoundError) {
-	pterm.Error.Println("Please check if the branch name is correct or use 'main' branch")
+	pterm.Error.Printfln("Branch %q does not exist in the chart repository", err.Branch)
+	pterm.Info.Println("Check the ref, or pass an existing one with --ref (e.g. --ref main)")
 }
 
 func (eh *ErrorHandler) handleGenericError(err error) {
@@ -132,7 +142,10 @@ func (eh *ErrorHandler) handleGenericError(err error) {
 			fmt.Println()
 			pterm.Info.Printf("🔧 Troubleshooting steps:\n")
 			pterm.Printf("  1. Check Docker is running: docker info\n")
-			pterm.Printf("  2. Check available ports: lsof -i :6550\n")
+			// 6550 is only the preferred API port; k3d falls back to 6551/6552
+			// when it is taken (providers/k3d/ports.go), and that fallback is
+			// exactly what a port conflict looks like.
+			pterm.Printf("  2. Check the API ports are free: lsof -i :6550-6552\n")
 			pterm.Printf("  3. Try with different name: openframe cluster create my-test\n")
 			pterm.Printf("  4. Check k3d directly: k3d version\n")
 		} else {
@@ -183,15 +196,6 @@ func (eh *ErrorHandler) isUserInterruption(err error) bool {
 	return isInterruption(err)
 }
 
-// CreateValidationError creates a new validation error
-func CreateValidationError(field, value, message string) *ValidationError {
-	return &ValidationError{
-		Field:   field,
-		Value:   value,
-		Message: message,
-	}
-}
-
 // BranchNotFoundError represents a branch not found error
 type BranchNotFoundError struct {
 	Branch string
@@ -204,27 +208,6 @@ func (e *BranchNotFoundError) Error() string {
 // NewBranchNotFoundError creates a new branch not found error
 func NewBranchNotFoundError(branch string) *BranchNotFoundError {
 	return &BranchNotFoundError{Branch: branch}
-}
-
-// CreateCommandError creates a new command error
-func CreateCommandError(command string, args []string, err error) *CommandError {
-	return &CommandError{
-		Command: command,
-		Args:    args,
-		Err:     err,
-	}
-}
-
-// IsValidationError checks if an error is a validation error
-func IsValidationError(err error) bool {
-	var target *ValidationError
-	return stderrors.As(err, &target)
-}
-
-// IsCommandError checks if an error is a command error
-func IsCommandError(err error) bool {
-	var target *CommandError
-	return stderrors.As(err, &target)
 }
 
 // HandleGlobalError provides a global error handling entry point

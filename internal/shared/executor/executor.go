@@ -13,6 +13,7 @@ import (
 	"time"
 
 	"github.com/flamingo-stack/openframe-cli/internal/shared/redact"
+	"github.com/pterm/pterm"
 )
 
 // WSL error exit codes
@@ -44,17 +45,36 @@ func (e *WSLError) Error() string {
 }
 
 // CommandError is returned when an external command exits non-zero. It carries
-// the child's exit code so the top level can propagate it (exit-code fidelity for
-// automation), while its Error() message is byte-identical to the previous plain
-// error so all existing string-based handling keeps working.
+// the child's exit code so the top level can propagate it (exit-code fidelity
+// for automation) AND the child's stderr — without it the message degrades to
+// the useless "exit status 1" (`*exec.ExitError`'s own string), and the actual
+// reason ("port 6550 already allocated", "no space left on device") was only
+// ever printed under --verbose. Modelled on WSLError above.
+//
+// Stderr arrives already redacted from the executor (secrets can be echoed back
+// by child processes).
 type CommandError struct {
 	Command  string
 	ExitCode int
+	Stderr   string
 	cause    error
 }
 
+// maxStderrInError bounds how much of a chatty child's stderr lands in the
+// error string; the full text is still available via the Stderr field.
+const maxStderrInError = 2000
+
 func (e *CommandError) Error() string {
-	return fmt.Sprintf("command failed: %s (exit code: %d): %v", e.Command, e.ExitCode, e.cause)
+	msg := fmt.Sprintf("command failed: %s (exit code: %d)", e.Command, e.ExitCode)
+	if reason := strings.TrimSpace(e.Stderr); reason != "" {
+		if len(reason) > maxStderrInError {
+			reason = "..." + reason[len(reason)-maxStderrInError:]
+		}
+		return msg + ": " + reason
+	}
+	// No stderr (e.g. the child only wrote to stdout): fall back to the exec
+	// error, which at least carries the signal/exit description.
+	return fmt.Sprintf("%s: %v", msg, e.cause)
 }
 
 // Unwrap exposes the underlying exec error so errors.As/Is still reach it.
@@ -125,31 +145,6 @@ func ResetWSLCache() {
 	defer wslCheckMutex.Unlock()
 	wslChecked = false
 	wslUbuntuChecked = false
-}
-
-// WakeUpWSL sends a simple command to WSL to ensure it's responsive
-// This is useful before critical operations as WSL can become unresponsive when idle
-// Returns nil if WSL is responsive, error otherwise
-func WakeUpWSL() error {
-	if runtime.GOOS != "windows" {
-		return nil
-	}
-
-	// Quick ping to WSL - just echo something
-	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
-	defer cancel()
-
-	cmd := exec.CommandContext(ctx, "wsl", "-d", "Ubuntu", "echo", "ping")
-	output, err := cmd.Output()
-	if err != nil {
-		return fmt.Errorf("WSL wake-up failed: %w", err)
-	}
-
-	if strings.TrimSpace(string(output)) != "ping" {
-		return fmt.Errorf("WSL wake-up returned unexpected output: %s", string(output))
-	}
-
-	return nil
 }
 
 // TryRecoverWSL attempts to recover WSL connectivity by terminating and restarting the distribution
@@ -339,11 +334,12 @@ func (e *RealCommandExecutor) ExecuteWithOptions(ctx context.Context, options Ex
 		Stderr: "",
 	}
 
-	// Handle dry-run mode
+	// Handle dry-run mode. The "Would run:" line prints UNCONDITIONALLY (not
+	// only under --verbose): showing what would execute is dry-run's entire
+	// purpose — without it a dry-run was indistinguishable from a real
+	// successful run (audit B6/T2-9). pterm.Info honors --silent.
 	if e.dryRun {
-		if e.verbose {
-			fmt.Printf("Would run: %s\n", redact.Redact(fullCommand))
-		}
+		pterm.Info.Printf("Would run: %s\n", redact.Redact(fullCommand))
 		result.Duration = time.Since(start)
 		return result, nil
 	}
@@ -394,20 +390,31 @@ func (e *RealCommandExecutor) ExecuteWithOptions(ctx context.Context, options Ex
 		var exitError *exec.ExitError
 		if errors.As(err, &exitError) {
 			result.ExitCode = exitError.ExitCode()
-			result.Stderr = string(exitError.Stderr)
+			// Redact at the population chokepoint: callers embed Stderr in
+			// user-facing errors even in non-verbose mode (e.g. the helm
+			// manager's "Helm output: %s"), and a child process can echo a
+			// token back. Control-flow substring checks downstream match
+			// generic phrases, never secret values, so redaction is safe here.
+			result.Stderr = redact.Redact(string(exitError.Stderr))
 		} else {
 			result.ExitCode = -1
 		}
 
-		// Log error in verbose mode
+		// Log error in verbose mode. pterm.Debug, not fmt.Printf: the latter
+		// writes straight to stdout, so these diagnostics survived --silent and
+		// corrupted machine-readable output (`cluster list -o json`).
 		if e.verbose {
-			fmt.Printf("Command failed: %s (exit code: %d)\n", redact.Redact(fullCommand), result.ExitCode)
+			pterm.Debug.Printfln("Command failed: %s (exit code: %d)", redact.Redact(fullCommand), result.ExitCode)
 			if result.Stderr != "" {
-				fmt.Printf("Stderr: %s\n", redact.Redact(result.Stderr))
+				pterm.Debug.Printfln("Stderr: %s", redact.Redact(result.Stderr))
 			}
 		}
 
-		// Check for WSL-specific errors on Windows
+		// Check for WSL-specific errors on Windows.
+		// Error fields are REDACTED at construction: unlike the verbose prints
+		// above, these errors reach user-facing output through the error handler
+		// even in non-verbose mode, so a secret in argv or echoed back on stderr
+		// (e.g. a URL-embedded token) must never survive into them (audit B5).
 		if runtime.GOOS == "windows" && (command == "wsl" || options.Command == "helm" || options.Command == "k3d") {
 			// For WSL commands, stderr is often redirected to stdout via 2>&1
 			// Use stdout as error output if stderr is empty
@@ -421,8 +428,8 @@ func (e *RealCommandExecutor) ExecuteWithOptions(ctx context.Context, options Ex
 				wslErr := &WSLError{
 					Operation:  fmt.Sprintf("executing %s", options.Command),
 					ExitCode:   result.ExitCode,
-					Stderr:     errorOutput,
-					Suggestion: GetWSLErrorSuggestion(result.ExitCode, fullCommand),
+					Stderr:     redact.Redact(errorOutput),
+					Suggestion: GetWSLErrorSuggestion(result.ExitCode, redact.Redact(fullCommand)),
 				}
 				return result, wslErr
 			}
@@ -431,21 +438,27 @@ func (e *RealCommandExecutor) ExecuteWithOptions(ctx context.Context, options Ex
 				wslErr := &WSLError{
 					Operation:  fmt.Sprintf("executing %s via WSL", options.Command),
 					ExitCode:   result.ExitCode,
-					Stderr:     errorOutput,
-					Suggestion: GetWSLErrorSuggestion(result.ExitCode, fullCommand),
+					Stderr:     redact.Redact(errorOutput),
+					Suggestion: GetWSLErrorSuggestion(result.ExitCode, redact.Redact(fullCommand)),
 				}
 				return result, wslErr
 			}
 		}
 
-		return result, &CommandError{Command: fullCommand, ExitCode: result.ExitCode, cause: err}
+		// result.Stderr was already redacted where it was populated.
+		return result, &CommandError{
+			Command:  redact.Redact(fullCommand),
+			ExitCode: result.ExitCode,
+			Stderr:   result.Stderr,
+			cause:    err,
+		}
 	}
 
 	result.ExitCode = 0
 
-	// Log success in verbose mode
+	// Log success in verbose mode (see above: pterm.Debug, not fmt.Printf).
 	if e.verbose {
-		fmt.Printf("Command completed successfully: %s (took %v)\n", redact.Redact(fullCommand), result.Duration)
+		pterm.Debug.Printfln("Command completed successfully: %s (took %v)", redact.Redact(fullCommand), result.Duration)
 	}
 
 	return result, nil

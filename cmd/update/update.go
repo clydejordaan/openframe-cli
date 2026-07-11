@@ -7,6 +7,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"os"
+	"time"
 
 	"github.com/flamingo-stack/openframe-cli/internal/shared/selfupdate"
 	"github.com/flamingo-stack/openframe-cli/internal/shared/ui"
@@ -73,7 +74,7 @@ func newCheckCmd(current string) *cobra.Command {
 		Args:         cobra.NoArgs,
 		SilenceUsage: true,
 		RunE: func(cmd *cobra.Command, _ []string) error {
-			u := selfupdate.Updater{Current: current, Client: selfupdate.Client{Token: os.Getenv("GITHUB_TOKEN")}}
+			u := selfupdate.Updater{Current: current, Client: selfupdate.Client{Token: selfupdate.GitHubToken()}}
 
 			// Spinner only in human (text) mode — json/yaml must keep stdout clean.
 			var sp *spinner.Spinner
@@ -116,7 +117,12 @@ func newRollbackCmd(current string) *cobra.Command {
 func run(ctx context.Context, current, target string, assumeYes, force bool) error {
 	u := selfupdate.Updater{
 		Current: current,
-		Client:  selfupdate.Client{Token: os.Getenv("GITHUB_TOKEN")},
+		Client:  selfupdate.Client{Token: selfupdate.GitHubToken()},
+		// Warnings must survive the spinner: they print above it, on stderr, so
+		// they stay on screen after the operation finishes and never mix into
+		// stdout. Routing them through the progress callback (as before) turned
+		// them into spinner text that the next step overwrote within a frame.
+		Warn: func(msg string) { pterm.Warning.WithWriter(os.Stderr).Println(msg) },
 	}
 	sp := spinner.Start("Checking for updates...")
 	st, rel, err := u.Check(ctx, target)
@@ -136,9 +142,13 @@ func run(ctx context.Context, current, target string, assumeYes, force bool) err
 	sp.Stop() // stop before the interactive confirm prompt
 
 	// "Update", "Downgrade", or "Reinstall" depending on the target direction.
+	// Replacing the running binary needs explicit consent: interactively via the
+	// prompt, non-interactively via --yes. The old `!assumeYes && !IsNonInteractive()`
+	// guard silently AUTO-CONFIRMED in CI/piped sessions — inverted polarity.
+	// (Opt-in unattended updates go through OPENFRAME_AUTO_UPDATE, not this path.)
 	verb := selfupdate.ChangeVerb(st.Current, rel.TagName)
-	if !assumeYes && !ui.IsNonInteractive() {
-		ok, err := ui.ConfirmActionInteractive(fmt.Sprintf("%s from %s to %s?", verb, st.Current, rel.TagName), true)
+	if !assumeYes {
+		ok, err := ui.RequireConfirmation(fmt.Sprintf("%s from %s to %s?", verb, st.Current, rel.TagName), "--yes", true)
 		if err != nil {
 			return err
 		}
@@ -148,8 +158,12 @@ func run(ctx context.Context, current, target string, assumeYes, force bool) err
 		}
 	}
 
+	// cmd.Context() is signal-cancelled but has no deadline; a stalled download
+	// would otherwise spin the spinner forever (Ctrl-C aside).
+	actx, acancel := context.WithTimeout(ctx, 15*time.Minute)
+	defer acancel()
 	apply := spinner.Start(fmt.Sprintf("%s to %s...", verb, rel.TagName))
-	if err := u.Apply(ctx, rel, func(msg string) { apply.UpdateText(msg) }); err != nil {
+	if err := u.Apply(actx, rel, func(msg string) { apply.UpdateText(msg) }); err != nil {
 		apply.Fail(fmt.Sprintf("%s failed", verb))
 		return err
 	}
@@ -169,8 +183,10 @@ func runRollback(ctx context.Context, current string, assumeYes bool) error {
 	if label == "" {
 		label = "the previous version" // binary exists but couldn't report its version
 	}
-	if !assumeYes && !ui.IsNonInteractive() {
-		confirmed, err := ui.ConfirmActionInteractive(fmt.Sprintf("Roll back from %s to %s?", current, label), true)
+	// Same consent rule as run(): never replace the binary in a non-interactive
+	// session without an explicit --yes.
+	if !assumeYes {
+		confirmed, err := ui.RequireConfirmation(fmt.Sprintf("Roll back from %s to %s?", current, label), "--yes", true)
 		if err != nil {
 			return err
 		}

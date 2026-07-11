@@ -18,6 +18,8 @@ import (
 	"runtime"
 	"strings"
 	"time"
+
+	sharedconfig "github.com/flamingo-stack/openframe-cli/internal/shared/config"
 )
 
 const (
@@ -28,8 +30,12 @@ const (
 	distroEnv = "OPENFRAME_WSL_DISTRO"
 	// BinaryInWSL is the OpenFrame executable name expected on the PATH in WSL.
 	BinaryInWSL = "openframe"
-	// disableEnv, when set, bypasses forwarding and runs natively on Windows
-	// (unsupported; provided as a debugging escape hatch).
+	// disableEnv, when set, bypasses forwarding and runs the CLI natively on
+	// Windows. UNSUPPORTED, and not merely "untested": the cluster (Docker +
+	// k3d) lives inside WSL, and the native code paths that used to reach it
+	// from the outside were removed as dead. Read-only commands (--help,
+	// --version, completion) work; anything touching a cluster will fail with
+	// a platform error. It exists only to debug the launcher itself.
 	disableEnv = "OPENFRAME_NO_WSL_FORWARD"
 )
 
@@ -64,11 +70,13 @@ var forwardedEnvVars = []string{
 
 // ShouldForward reports whether this process must re-run itself inside WSL: only
 // the native Windows build forwards, and only when not explicitly disabled.
+// The opt-out is strictly parsed: OPENFRAME_NO_WSL_FORWARD=0/false still
+// forwards (the old any-non-empty check treated them as "disable").
 func ShouldForward() bool {
 	if runtime.GOOS != "windows" {
 		return false
 	}
-	return os.Getenv(disableEnv) == ""
+	return !sharedconfig.EnvBool(disableEnv)
 }
 
 // Forward re-runs `openframe <args>` inside WSL, passing through stdio, the

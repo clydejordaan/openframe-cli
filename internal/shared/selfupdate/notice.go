@@ -7,6 +7,8 @@ import (
 	"os"
 	"path/filepath"
 	"time"
+
+	sharedconfig "github.com/flamingo-stack/openframe-cli/internal/shared/config"
 )
 
 // checkInterval is how often the passive notice re-queries GitHub. Between
@@ -59,7 +61,7 @@ func saveState(s noticeState) {
 // output all report non-interactive via ui.IsNonInteractive), or a dev build
 // with no comparable version.
 func noticeSuppressed(current string, interactive bool) bool {
-	if os.Getenv("OPENFRAME_NO_UPDATE_CHECK") != "" {
+	if sharedconfig.EnvBool("OPENFRAME_NO_UPDATE_CHECK") {
 		return true
 	}
 	if !interactive {
@@ -88,7 +90,7 @@ func MaybeNotify(ctx context.Context, current string, interactive bool) string {
 
 	ctx, cancel := context.WithTimeout(ctx, 2*time.Second)
 	defer cancel()
-	rel, err := Client{Token: os.Getenv("GITHUB_TOKEN")}.Latest(ctx)
+	rel, err := Client{Token: GitHubToken()}.Latest(ctx)
 	if err != nil {
 		return "" // best effort; stay silent on any failure
 	}

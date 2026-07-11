@@ -2,6 +2,7 @@ package helm
 
 import (
 	"context"
+	"encoding/json"
 	stderrors "errors"
 	"fmt"
 	"os"
@@ -18,6 +19,7 @@ import (
 	"github.com/flamingo-stack/openframe-cli/internal/platform"
 	sharedconfig "github.com/flamingo-stack/openframe-cli/internal/shared/config"
 	"github.com/flamingo-stack/openframe-cli/internal/shared/executor"
+	"github.com/flamingo-stack/openframe-cli/internal/shared/redact"
 	uispinner "github.com/flamingo-stack/openframe-cli/internal/shared/ui/spinner"
 	"github.com/pterm/pterm"
 	k8serrors "k8s.io/apimachinery/pkg/api/errors"
@@ -184,9 +186,29 @@ func (h *HelmManager) UninstallRelease(ctx context.Context, releaseName, namespa
 		Env:     h.getHelmEnv(),
 	})
 	if err != nil {
-		return fmt.Errorf("helm uninstall %s: %w", releaseName, err)
+		// Name the target: "helm uninstall argo-cd: exit status 1" gave no way
+		// to tell which namespace, or which cluster, the failure happened in.
+		target := fmt.Sprintf("release %s in namespace %s", releaseName, namespace)
+		if kubeContext != "" {
+			target += fmt.Sprintf(" (context %s)", kubeContext)
+		}
+		return fmt.Errorf("helm uninstall of %s failed: %w", target, err)
 	}
 	return nil
+}
+
+// helmKubeContext resolves the kube-context every helm CLI call targets: an
+// explicit cfg.KubeContext (from --context / the interactive target selector)
+// wins, otherwise the context of the selected cluster. One install must never
+// talk to two clusters (audit F4).
+func helmKubeContext(cfg config.ChartInstallConfig) string {
+	if cfg.KubeContext != "" {
+		return cfg.KubeContext
+	}
+	if cfg.ClusterName != "" {
+		return k8s.ResolveContextForCluster(k8s.DefaultKubeconfigPath(), cfg.ClusterName)
+	}
+	return ""
 }
 
 // argoCDInstallArgs builds the `helm upgrade --install argo-cd` argument list.
@@ -202,8 +224,8 @@ func argoCDInstallArgs(cfg config.ChartInstallConfig, valuesFilePath string) []s
 		"--timeout", "7m",
 		"-f", valuesFilePath,
 	}
-	if cfg.ClusterName != "" {
-		args = append(args, "--kube-context", k8s.ResolveContextForCluster(k8s.DefaultKubeconfigPath(), cfg.ClusterName))
+	if kubeContext := helmKubeContext(cfg); kubeContext != "" {
+		args = append(args, "--kube-context", kubeContext)
 	}
 	if cfg.DryRun {
 		// Explicit client-side dry-run: the bare --dry-run form is deprecated in
@@ -368,11 +390,14 @@ func (h *HelmManager) InstallArgoCDWithProgress(ctx context.Context, config conf
 		h.showArgoCDDiagnostics(ctx, config.ClusterName)
 
 		// Include stdout and stderr output for better debugging
-		// On Windows/WSL, stderr is redirected to stdout via 2>&1, so check both
+		// On Windows/WSL, stderr is redirected to stdout via 2>&1, so check both.
+		// Stderr is redacted by the executor at population; stdout is NOT (callers
+		// parse it), so redact it here — helm's rendered output can echo values,
+		// including the docker registry password, into a user-facing error.
 		if result != nil {
 			output := result.Stderr
 			if output == "" {
-				output = result.Stdout
+				output = redact.Redact(result.Stdout)
 			}
 			if output != "" {
 				return fmt.Errorf("failed to install ArgoCD: %w\nHelm output: %s", err, output)
@@ -381,16 +406,33 @@ func (h *HelmManager) InstallArgoCDWithProgress(ctx context.Context, config conf
 		return fmt.Errorf("failed to install ArgoCD: %w", err)
 	}
 
-	// Log Helm output for debugging (helps identify if Helm actually created resources)
+	// Log Helm output for debugging (helps identify if Helm actually created
+	// resources). Stdout is redacted at the PRINT site (not in the result
+	// struct, which callers parse): helm's rendered output can echo values —
+	// including the docker registry password — in verbose/dry-run mode.
+	// Stderr arrives already redacted by the executor.
 	if config.Verbose && result != nil {
 		if result.Stdout != "" {
 			pterm.Info.Println("Helm stdout:")
-			pterm.Println(result.Stdout)
+			pterm.Println(redact.Redact(result.Stdout))
 		}
 		if result.Stderr != "" {
 			pterm.Info.Println("Helm stderr:")
 			pterm.Println(result.Stderr)
 		}
+	}
+
+	// Dry-run creates nothing: helm ran with --dry-run=client and the executor
+	// suppressed real calls entirely, so verifying the release or waiting for
+	// deployments below would fail by construction ("helm list returned
+	// empty"). Caught by the e2e `--context ... --non-interactive --dry-run`
+	// step the moment the N2 fix made this path reachable.
+	if config.DryRun {
+		if spinner != nil {
+			spinner.Stop()
+		}
+		pterm.Info.Println("Skipping release verification and deployment waits (dry-run)")
+		return nil
 	}
 
 	// Verify the Helm release was actually created by checking helm list
@@ -537,15 +579,26 @@ func (h *HelmManager) InstallAppOfAppsFromLocal(ctx context.Context, config conf
 		}
 	}
 
-	// Add explicit kube-context if cluster name is provided (important for Windows/WSL)
-	if config.ClusterName != "" {
-		contextName := k8s.ResolveContextForCluster(k8s.DefaultKubeconfigPath(), config.ClusterName)
-		args = append(args, "--kube-context", contextName)
+	// Add the explicit kube-context (important for Windows/WSL; an explicit
+	// --context wins over the cluster-derived one — F4 one-target rule)
+	if kubeContext := helmKubeContext(config); kubeContext != "" {
+		args = append(args, "--kube-context", kubeContext)
 	}
 
 	if config.DryRun {
 		// Client-side dry-run (bare --dry-run is deprecated in Helm 3).
 		args = append(args, "--dry-run=client")
+	}
+
+	// This helm call carries `--wait --timeout <appConfig.Timeout>` (60m by
+	// default) and produces no output while it blocks. Without an indicator the
+	// CLI looks hung for the longest phase of an install — mirror the spinner
+	// InstallArgoCDWithProgress uses.
+	var spinner *uispinner.Spinner
+	if !config.Silent && !config.NonInteractive {
+		spinner = uispinner.Start("Installing the OpenFrame app-of-apps chart...")
+	} else {
+		pterm.Info.Println("Installing the OpenFrame app-of-apps chart...")
 	}
 
 	// Execute helm command with local chart path
@@ -556,6 +609,9 @@ func (h *HelmManager) InstallAppOfAppsFromLocal(ctx context.Context, config conf
 	})
 
 	if err != nil {
+		if spinner != nil {
+			spinner.Fail("app-of-apps installation failed")
+		}
 		// Check if the error is due to context cancellation (CTRL-C)
 		if ctx.Err() == context.Canceled {
 			return ctx.Err() // Return context cancellation directly without extra messaging
@@ -568,29 +624,55 @@ func (h *HelmManager) InstallAppOfAppsFromLocal(ctx context.Context, config conf
 		return fmt.Errorf("failed to install app-of-apps: %w", err)
 	}
 
+	if spinner != nil {
+		spinner.Success("app-of-apps chart installed")
+	}
+
 	return nil
 }
 
-// GetChartStatus returns the status of a chart
-func (h *HelmManager) GetChartStatus(ctx context.Context, releaseName, namespace string) (models.ChartInfo, error) {
-	args := []string{"status", releaseName, "-n", namespace, "--output", "json"}
+// helmMetadata is the subset of `helm get metadata --output json` we consume.
+type helmMetadata struct {
+	Name       string `json:"name"`
+	Namespace  string `json:"namespace"`
+	Status     string `json:"status"`
+	Version    string `json:"version"`    // chart version, e.g. "0.1.0"
+	AppVersion string `json:"appVersion"` // packaged app version, e.g. "1.16.0"
+}
 
-	_, err := h.executor.ExecuteWithOptions(ctx, executor.ExecuteOptions{
+// GetChartStatus returns the real status of a release.
+//
+// It used to run `helm status --output json`, discard the output, and return a
+// literal {Status: "deployed", Version: "1.0.0"} — so a failed release reported
+// itself as deployed, and every chart reported version 1.0.0.
+//
+// `helm get metadata` is used rather than `helm status` because status's JSON
+// carries no chart version at all, and its top-level "version" field is the
+// RELEASE REVISION (1, 2, 3...), not the chart version. Parsing that would have
+// swapped one wrong answer for another.
+func (h *HelmManager) GetChartStatus(ctx context.Context, releaseName, namespace string) (models.ChartInfo, error) {
+	args := []string{"get", "metadata", releaseName, "-n", namespace, "--output", "json"}
+
+	result, err := h.executor.ExecuteWithOptions(ctx, executor.ExecuteOptions{
 		Command: "helm",
 		Args:    args,
 		Env:     h.getHelmEnv(),
 	})
 	if err != nil {
-		return models.ChartInfo{}, fmt.Errorf("failed to get chart status: %w", err)
+		return models.ChartInfo{}, fmt.Errorf("failed to get status of release %s in namespace %s: %w", releaseName, namespace, err)
 	}
 
-	// Parse JSON output and return chart info
-	// For now, return basic info
+	var meta helmMetadata
+	if err := json.Unmarshal([]byte(strings.TrimSpace(result.Stdout)), &meta); err != nil {
+		return models.ChartInfo{}, fmt.Errorf("failed to parse `helm get metadata` output for release %s: %w", releaseName, err)
+	}
+
 	return models.ChartInfo{
-		Name:      releaseName,
-		Namespace: namespace,
-		Status:    "deployed", // Parse from JSON
-		Version:   "1.0.0",    // Parse from JSON
+		Name:       meta.Name,
+		Namespace:  meta.Namespace,
+		Status:     meta.Status,
+		Version:    meta.Version,
+		AppVersion: meta.AppVersion,
 	}, nil
 }
 

@@ -1,19 +1,25 @@
 // Package selfupdate checks for newer published releases of the OpenFrame CLI
 // and replaces the running binary in place.
 //
-// Phase 1 (this file set) verifies every artifact by SHA256 against the
-// release's checksums.txt before it touches disk, reusing the verified-download
-// substrate in internal/shared/download. Phase 2 will additionally verify the
-// cosign (keyless) signature of checksums.txt with a pinned OIDC identity, so
-// authenticity — not just integrity — is guaranteed.
+// Integrity: every artifact is verified by SHA256 against the release's
+// checksums.txt before it touches disk, reusing the verified-download substrate
+// in internal/shared/download.
+//
+// Authenticity: checksums.txt itself is verified against the release's cosign
+// (keyless) signature bundle, pinned to this repository's GitHub Actions OIDC
+// identity — see cosign.go. OPENFRAME_UPDATE_INSECURE_SKIP_VERIFY downgrades to
+// integrity-only, loudly.
 package selfupdate
 
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"net/http"
+	"net/url"
+	"os"
 	"strings"
 	"time"
 )
@@ -65,6 +71,18 @@ type Client struct {
 	Token   string // optional; raises the unauthenticated rate limit
 }
 
+// GitHubToken returns the GitHub API token from the environment, accepting both
+// conventions: GITHUB_TOKEN (GitHub Actions) and GH_TOKEN (the gh CLI). Without
+// a token the API is unauthenticated and rate-limited per source IP — which is
+// how CI on shared macOS runners hit "HTTP 403" mid-update. A user who has only
+// authenticated `gh` (GH_TOKEN) gets the higher limit too.
+func GitHubToken() string {
+	if t := os.Getenv("GITHUB_TOKEN"); t != "" {
+		return t
+	}
+	return os.Getenv("GH_TOKEN")
+}
+
 func (c Client) httpClient() *http.Client {
 	if c.HTTP != nil {
 		return c.HTTP
@@ -86,9 +104,39 @@ func (c Client) Latest(ctx context.Context) (Release, error) {
 	return c.getRelease(ctx, "/repos/"+repoOwner+"/"+repoName+"/releases/latest")
 }
 
-// ForTag returns the release for an exact tag (e.g. "v1.2.3").
+// ErrReleaseNotFound reports that no release exists for the requested tag.
+var ErrReleaseNotFound = errors.New("no matching release found")
+
+// ForTag returns the release for a tag. Releases in this repo are tagged with
+// the bare semver ("0.4.7"), but users habitually type "v0.4.7" (and the help
+// text shows that form), so on a not-found miss the alternate spelling — with
+// or without the "v" prefix — is tried before giving up (T0-3).
 func (c Client) ForTag(ctx context.Context, tag string) (Release, error) {
-	return c.getRelease(ctx, "/repos/"+repoOwner+"/"+repoName+"/releases/tags/"+tag)
+	rel, err := c.getRelease(ctx, releaseTagPath(tag))
+	if err == nil || !errors.Is(err, ErrReleaseNotFound) {
+		return rel, err
+	}
+	alt := alternateTag(tag)
+	if alt == tag {
+		return rel, err
+	}
+	relAlt, errAlt := c.getRelease(ctx, releaseTagPath(alt))
+	if errAlt != nil {
+		return Release{}, fmt.Errorf("no release found for tag %q (also tried %q)", tag, alt)
+	}
+	return relAlt, nil
+}
+
+func releaseTagPath(tag string) string {
+	return "/repos/" + repoOwner + "/" + repoName + "/releases/tags/" + url.PathEscape(tag)
+}
+
+// alternateTag toggles the "v" prefix on a tag.
+func alternateTag(tag string) string {
+	if v := strings.TrimPrefix(tag, "v"); v != tag {
+		return v
+	}
+	return "v" + tag
 }
 
 func (c Client) getRelease(ctx context.Context, path string) (Release, error) {
@@ -107,7 +155,7 @@ func (c Client) getRelease(ctx context.Context, path string) (Release, error) {
 	}
 	defer func() { _ = resp.Body.Close() }()
 	if resp.StatusCode == http.StatusNotFound {
-		return Release{}, fmt.Errorf("no matching release found")
+		return Release{}, ErrReleaseNotFound
 	}
 	if resp.StatusCode != http.StatusOK {
 		return Release{}, fmt.Errorf("release query failed: HTTP %d", resp.StatusCode)

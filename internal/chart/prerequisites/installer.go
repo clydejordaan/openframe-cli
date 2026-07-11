@@ -2,7 +2,6 @@ package prerequisites
 
 import (
 	"fmt"
-	"os/exec"
 	"strings"
 
 	"github.com/flamingo-stack/openframe-cli/internal/chart/prerequisites/certificates"
@@ -22,20 +21,6 @@ func NewInstaller() *Installer {
 	return &Installer{
 		checker: NewPrerequisiteChecker(),
 	}
-}
-
-func (i *Installer) InstallMissingPrerequisites() error {
-	allPresent, missing := i.checker.CheckAll()
-	if allPresent {
-		pterm.Success.Println("All prerequisites are already installed.")
-		return nil
-	}
-
-	return i.installMissingTools(missing)
-}
-
-func (i *Installer) installMissingTools(tools []string) error {
-	return i.installMissingToolsNonInteractive(tools, false)
 }
 
 // installMissingToolsNonInteractive installs missing tools with optional non-interactive mode
@@ -97,12 +82,9 @@ func (i *Installer) installMissingToolsNonInteractive(tools []string, nonInterac
 	}
 
 	if len(stillMissingInstallable) > 0 {
-		// In non-interactive mode, just warn and continue
-		if nonInteractive {
-			pterm.Warning.Printf("Some tools are still missing: %s\n", strings.Join(stillMissingInstallable, ", "))
-			pterm.Info.Println("Continuing with available tools (non-interactive mode)...")
-			return nil
-		}
+		// Fail fast in BOTH modes: "continuing with available tools" just moved
+		// the failure into the helm install minutes later with a misleading
+		// error, which is worse in CI, not better.
 		pterm.Warning.Printf("Some tools are still missing: %s\n", strings.Join(stillMissingInstallable, ", "))
 		return fmt.Errorf("installation completed but some tools are still missing: %s", strings.Join(stillMissingInstallable, ", "))
 	}
@@ -115,10 +97,6 @@ func (i *Installer) installMissingToolsNonInteractive(tools []string, nonInterac
 		pterm.Success.Println("All prerequisites installed successfully!")
 	}
 	return nil
-}
-
-func (i *Installer) installTool(tool string) error {
-	return i.installToolNonInteractive(tool, false)
 }
 
 // installToolNonInteractive installs a single tool with optional non-interactive mode
@@ -140,24 +118,6 @@ func (i *Installer) installToolNonInteractive(tool string, nonInteractive bool) 
 	}
 }
 
-func (i *Installer) runCommand(name string, args ...string) error {
-	// Handle shell commands with pipes
-	if strings.Contains(strings.Join(args, " "), "|") {
-		fullCmd := name + " " + strings.Join(args, " ")
-		cmd := exec.Command("bash", "-c", fullCmd) // #nosec G204 -- shell string built from constant/program-derived values, not untrusted input
-		// Completely silence output during installation
-		return cmd.Run()
-	}
-
-	cmd := exec.Command(name, args...) // #nosec G204 -- explicit argv, no shell; command and args are internal, not untrusted input
-	// Completely silence output during installation
-	return cmd.Run()
-}
-
-func (i *Installer) CheckAndInstall() error {
-	return i.CheckAndInstallNonInteractive(false)
-}
-
 // CheckAndInstallNonInteractive checks and installs prerequisites with optional non-interactive mode
 func (i *Installer) CheckAndInstallNonInteractive(nonInteractive bool) error {
 	_, missing := i.checker.CheckAll()
@@ -168,7 +128,7 @@ func (i *Installer) CheckAndInstallNonInteractive(nonInteractive bool) error {
 
 	// Show memory warning if insufficient (but don't block)
 	if !sufficient {
-		pterm.Warning.Printf("⚠️  Memory Warning: %d MB available, %d MB recommended\n", current, recommended)
+		pterm.Warning.Printfln("Insufficient memory: %d MB available, %d MB recommended", current, recommended)
 		pterm.Info.Println("Charts may not deploy successfully with insufficient memory. Consider adding more RAM.")
 		fmt.Println()
 	}
@@ -201,12 +161,9 @@ func (i *Installer) CheckAndInstallNonInteractive(nonInteractive bool) error {
 
 		if confirmed {
 			if err := i.installMissingToolsNonInteractive(installableMissing, nonInteractive); err != nil {
-				// In non-interactive mode, log error but continue
-				if nonInteractive {
-					pterm.Warning.Printf("Failed to install some prerequisites: %v\n", err)
-					pterm.Info.Println("Continuing anyway (non-interactive mode)...")
-					return nil
-				}
+				// Fail fast in BOTH modes: the old non-interactive "continuing
+				// anyway" deferred the failure to a guaranteed helm error with
+				// the real cause buried in a scrolled-past warning.
 				return err
 			}
 		} else {
