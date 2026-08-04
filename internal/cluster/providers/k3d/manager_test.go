@@ -147,6 +147,8 @@ func TestK3dManager_CreateCluster(t *testing.T) {
 				m.On("Execute", mock.Anything, "sudo", mock.Anything).Return(&execPkg.CommandResult{Stdout: ""}, nil).Maybe()
 				m.On("Execute", mock.Anything, "wsl", mock.Anything).Return(&execPkg.CommandResult{Stdout: "success"}, nil).Maybe()
 				m.On("Execute", mock.Anything, "k3d", mock.Anything).Return(&execPkg.CommandResult{Stdout: "success"}, nil).Maybe()
+				// The port scan runs `k3d cluster list` through ExecuteWithOptions (bounded).
+				m.On("ExecuteWithOptions", mock.Anything, mock.Anything).Return(&execPkg.CommandResult{Stdout: "[]"}, nil).Maybe()
 			},
 		},
 		{
@@ -169,6 +171,8 @@ func TestK3dManager_CreateCluster(t *testing.T) {
 				m.On("Execute", mock.Anything, "sudo", mock.Anything).Return(&execPkg.CommandResult{Stdout: ""}, nil).Maybe()
 				m.On("Execute", mock.Anything, "wsl", mock.Anything).Return(&execPkg.CommandResult{Stdout: "success"}, nil).Maybe()
 				m.On("Execute", mock.Anything, "k3d", mock.Anything).Return(&execPkg.CommandResult{Stdout: "success"}, nil).Maybe()
+				// The port scan runs `k3d cluster list` through ExecuteWithOptions (bounded).
+				m.On("ExecuteWithOptions", mock.Anything, mock.Anything).Return(&execPkg.CommandResult{Stdout: "[]"}, nil).Maybe()
 			},
 		},
 		{
@@ -199,6 +203,16 @@ func TestK3dManager_CreateCluster(t *testing.T) {
 			expectedError: "node count must be at least 1",
 		},
 		{
+			name: "cloud settings rejected for k3d",
+			config: models.ClusterConfig{
+				Name:      "test-cluster",
+				Type:      models.ClusterTypeK3d,
+				NodeCount: 3,
+				Cloud:     &models.CloudConfig{Region: "us-east-1"},
+			},
+			expectedError: "cloud settings are not valid for k3d clusters",
+		},
+		{
 			name: "k3d command fails",
 			config: models.ClusterConfig{
 				Name:      "test-cluster",
@@ -215,6 +229,8 @@ func TestK3dManager_CreateCluster(t *testing.T) {
 				m.On("Execute", mock.Anything, "sudo", mock.Anything).Return(&execPkg.CommandResult{Stdout: ""}, nil).Maybe()
 				m.On("Execute", mock.Anything, "wsl", mock.Anything).Return(&execPkg.CommandResult{Stdout: "success"}, nil).Maybe()
 				m.On("Execute", mock.Anything, "k3d", mock.Anything).Return(nil, errors.New("k3d error")).Maybe()
+				// The port scan runs `k3d cluster list` through ExecuteWithOptions (bounded).
+				m.On("ExecuteWithOptions", mock.Anything, mock.Anything).Return(&execPkg.CommandResult{Stdout: "[]"}, nil).Maybe()
 			},
 			expectedError: "failed to create cluster test-cluster",
 		},
@@ -268,6 +284,8 @@ func TestK3dManager_CreateCluster_VerboseMode(t *testing.T) {
 	executor.On("Execute", mock.Anything, "sudo", mock.Anything).Return(&execPkg.CommandResult{Stdout: ""}, nil).Maybe()
 	executor.On("Execute", mock.Anything, "wsl", mock.Anything).Return(&execPkg.CommandResult{Stdout: "success"}, nil).Maybe()
 	executor.On("Execute", mock.Anything, "k3d", mock.Anything).Return(&execPkg.CommandResult{Stdout: "success"}, nil).Maybe()
+	// The port scan runs `k3d cluster list` through ExecuteWithOptions (bounded).
+	executor.On("ExecuteWithOptions", mock.Anything, mock.Anything).Return(&execPkg.CommandResult{Stdout: "[]"}, nil).Maybe()
 
 	manager := NewK3dManager(executor, true) // verbose mode
 	config := models.ClusterConfig{

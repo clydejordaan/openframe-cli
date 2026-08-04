@@ -7,6 +7,7 @@ import (
 	"strings"
 
 	"github.com/flamingo-stack/openframe-cli/internal/shared/executor"
+	"github.com/flamingo-stack/openframe-cli/internal/shared/ui"
 	"github.com/pterm/pterm"
 )
 
@@ -119,52 +120,110 @@ func (eh *ErrorHandler) handleBranchNotFoundError(err *BranchNotFoundError) {
 	pterm.Info.Println("Check the ref, or pass an existing one with --ref (e.g. --ref main)")
 }
 
+// handleGenericError renders the structured failure panel:
+//
+//	✖ create failed for cluster big-gke
+//	  cause   googleapi: Error 403: quota exceeded
+//	  hint    💡 Request more quota, lower --nodes, or pick another region
+//	  resume  openframe cluster create big-gke
+//
+// One glance answers what failed, why, and what to do next — instead of the
+// previous single wall-of-text "❌ Operation failed / Error: a: b: c: d".
 func (eh *ErrorHandler) handleGenericError(err error) {
-	// Clean up common error patterns for better user experience
-	errorMsg := err.Error()
-
 	// Handle user interruptions (Ctrl+C). Do NOT os.Exit here — returning lets
 	// the caller's deferred cleanup run and the process exit via the normal
 	// error-return path.
 	if eh.isUserInterruption(err) {
-		fmt.Println()
-		pterm.Info.Println("Operation cancelled by user.")
+		printInterruption(err)
 		return
 	}
 
-	// Extract meaningful error from complex error chains
-	if strings.Contains(errorMsg, "cluster create operation failed") {
-		pterm.Error.Printf("❌ Failed to create cluster\n")
+	headline, cause := splitCause(err)
+	// In GitHub Actions the failure also becomes a job/PR annotation, so the
+	// cause is visible without opening the 40-minute log.
+	ui.ErrorAnnotation(headline, firstLine(cause))
+	pterm.Error.Printf("%s %s\n", ui.Glyphs().Fail, headline)
+	if cause != "" {
+		panelRow("cause", cause)
+	}
+	if eh.verbose && cause != "" && err.Error() != headline+": "+cause {
+		// The full chain names every wrapping layer — noise by default,
+		// useful when debugging which layer swallowed what.
+		panelRow("chain", err.Error())
+	}
+	if hint := genericHint(err); hint != "" {
+		panelRow("hint", "💡 "+hint)
+	}
+	var rh interface{ ResumeHint() string }
+	if stderrors.As(err, &rh) {
+		if hint := rh.ResumeHint(); hint != "" {
+			panelRow("resume", hint)
+		}
+	}
+}
 
-		// Try to extract the actual k3d error and give helpful advice
-		if strings.Contains(errorMsg, "exit status 1") && strings.Contains(errorMsg, "k3d cluster create") {
-			pterm.Printf("  Issue: k3d cluster creation failed\n")
-			fmt.Println()
-			pterm.Info.Printf("🔧 Troubleshooting steps:\n")
-			pterm.Printf("  1. Check Docker is running: docker info\n")
-			// 6550 is only the preferred API port; k3d falls back to 6551/6552
-			// when it is taken (providers/k3d/ports.go), and that fallback is
-			// exactly what a port conflict looks like.
-			pterm.Printf("  2. Check the API ports are free: lsof -i :6550-6552\n")
-			pterm.Printf("  3. Try with different name: openframe cluster create my-test\n")
-			pterm.Printf("  4. Check k3d directly: k3d version\n")
-		} else {
-			pterm.Printf("  Details: %s\n", errorMsg)
+// genericHint merges the pattern-matched friendly hint with the k3d-create
+// special case that used to be a separate hardcoded block.
+func genericHint(err error) string {
+	msg := err.Error()
+	if strings.Contains(msg, "cluster create operation failed") &&
+		strings.Contains(msg, "exit status 1") && strings.Contains(msg, "k3d cluster create") {
+		// 6550 is only the preferred API port; k3d falls back to 6551/6552
+		// when it is taken (providers/k3d/ports.go), and that fallback is
+		// exactly what a port conflict looks like.
+		return "Check Docker is running (docker info) and the API ports are free (lsof -i :6550-6552), then retry — or try another name"
+	}
+	return friendlyHint(err)
+}
+
+// splitCause splits an error chain into the outer description and the root
+// cause. "create failed for cluster X: quota exceeded" → ("create failed for
+// cluster X", "quota exceeded"). A chain of one keeps everything in the
+// headline (first line) with any remaining lines as the cause block.
+func splitCause(err error) (headline, cause string) {
+	full := err.Error()
+	deepest := err
+	unwrapped := false
+	for {
+		u := stderrors.Unwrap(deepest)
+		if u == nil {
+			break
 		}
-	} else {
-		// Generic error handling
-		pterm.Error.Printf("❌ Operation failed\n")
-		if eh.verbose {
-			pterm.Printf("  Details: %v\n", err)
-			pterm.Printf("  Type: %T\n", err)
-		} else {
-			// Show only the essential error message
-			pterm.Printf("  Error: %s\n", errorMsg)
+		deepest = u
+		unwrapped = true
+	}
+	if unwrapped {
+		causeText := deepest.Error()
+		if idx := strings.LastIndex(full, causeText); idx > 0 && causeText != "" {
+			head := strings.TrimRight(strings.TrimSuffix(full[:idx], ": "), ": \n")
+			if head != "" {
+				return head, causeText
+			}
 		}
-		// Add a plain-language next step for common failures (req 30).
-		if hint := friendlyHint(err); hint != "" {
-			pterm.Info.Printf("💡 %s\n", hint)
-		}
+	}
+	lines := strings.SplitN(full, "\n", 2)
+	if len(lines) == 2 {
+		return lines[0], lines[1]
+	}
+	return full, ""
+}
+
+// firstLine trims a possibly multi-line cause (pod logs, terraform output)
+// down to its first line for the one-line annotation surface.
+func firstLine(s string) string {
+	if i := strings.IndexByte(s, '\n'); i >= 0 {
+		return s[:i]
+	}
+	return s
+}
+
+// panelRow prints one aligned "key value" row of the failure panel; multi-line
+// values (pod logs, terraform output) stay indented under their key.
+func panelRow(key, value string) {
+	lines := strings.Split(strings.TrimRight(value, "\n"), "\n")
+	pterm.DefaultBasicText.Printf("  %s %s\n", pterm.FgGray.Sprintf("%-7s", key), lines[0])
+	for _, l := range lines[1:] {
+		pterm.DefaultBasicText.Printf("  %-7s %s\n", "", l)
 	}
 }
 
@@ -217,6 +276,16 @@ func HandleGlobalError(err error, verbose bool) error {
 		return nil
 	}
 
+	// A sentinel anywhere in the chain means an inner layer already displayed
+	// this error (the chart workflow calls this handler itself before its
+	// result travels back through the cmd layer, which calls it again) —
+	// re-rendering printed the same failure twice. Return the error as-is so
+	// the sentinel still maps to a non-zero exit without a second print.
+	var handled *AlreadyHandledError
+	if stderrors.As(err, &handled) {
+		return err
+	}
+
 	handler := NewErrorHandler(verbose)
 
 	// Display the error (interruptions get a friendly "cancelled" message). We
@@ -225,10 +294,25 @@ func HandleGlobalError(err error, verbose bool) error {
 	// cleanup (signal.Stop, cancel, temp-file restore) still runs. main.go
 	// recognises the sentinel and does not re-print the message.
 	if handler.isUserInterruption(err) {
-		fmt.Println()
-		pterm.Info.Println("Operation cancelled by user.")
+		printInterruption(err)
 	} else {
 		handler.HandleError(err)
 	}
 	return &AlreadyHandledError{OriginalError: err}
+}
+
+// printInterruption prints the "cancelled" notice, plus any resume hint an
+// error in the chain carries structurally. On an interruption the plain
+// err.Error() text is deliberately not shown, so a hint wrapped only as text
+// (e.g. "re-run create to resume") would be lost — a value implementing
+// ResumeHint() carries it through the swallow.
+func printInterruption(err error) {
+	fmt.Println()
+	pterm.Info.Println("Operation cancelled by user.")
+	var rh interface{ ResumeHint() string }
+	if stderrors.As(err, &rh) {
+		if hint := rh.ResumeHint(); hint != "" {
+			pterm.Info.Println(hint)
+		}
+	}
 }

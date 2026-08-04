@@ -4,9 +4,12 @@ import (
 	"fmt"
 
 	"github.com/flamingo-stack/openframe-cli/internal/cluster/models"
+	"github.com/flamingo-stack/openframe-cli/internal/cluster/prerequisites"
 	"github.com/flamingo-stack/openframe-cli/internal/cluster/ui"
 	"github.com/flamingo-stack/openframe-cli/internal/cluster/utils"
 	sharedErrors "github.com/flamingo-stack/openframe-cli/internal/shared/errors"
+	sharedUI "github.com/flamingo-stack/openframe-cli/internal/shared/ui"
+	"github.com/pterm/pterm"
 	"github.com/spf13/cobra"
 )
 
@@ -50,6 +53,24 @@ Examples:
 	return deleteCmd
 }
 
+// confirmCloudDeletion is the stronger destroy gate for cloud clusters:
+// re-typing the cluster name. Local clusters and --force pass through
+// (--force is the CI escape hatch); a non-interactive session without --force
+// refuses rather than hanging on a prompt — defense in depth behind the
+// generic confirmation, which may not always run before this.
+func confirmCloudDeletion(clusterType models.ClusterType, clusterName string, force bool) (bool, error) {
+	if clusterType != models.ClusterTypeEKS && clusterType != models.ClusterTypeGKE {
+		return true, nil
+	}
+	if force {
+		return true, nil
+	}
+	if sharedUI.IsNonInteractive() {
+		return false, fmt.Errorf("refusing to destroy cloud cluster '%s' non-interactively; pass --force to confirm", clusterName)
+	}
+	return ui.ConfirmTypedClusterName(clusterName)
+}
+
 func runDeleteCluster(cmd *cobra.Command, args []string) error {
 	service := utils.GetCommandService()
 	operationsUI := ui.NewOperationsUI()
@@ -82,6 +103,26 @@ func runDeleteCluster(cmd *cobra.Command, args []string) error {
 		return fmt.Errorf("failed to detect cluster type: %w", err)
 	}
 
+	// Destroying a cloud cluster deletes billed infrastructure irreversibly,
+	// so it takes a stronger gate than the generic yes/no above.
+	proceed, err := confirmCloudDeletion(clusterType, clusterName, globalFlags.Delete.Force)
+	if err != nil {
+		return sharedErrors.HandleGlobalError(err, globalFlags.Global.Verbose)
+	}
+	if !proceed {
+		pterm.Info.Println("Cluster name did not match — nothing was deleted")
+		return nil
+	}
+
+	// Type-aware prerequisite gate, mirroring create: it can only run here,
+	// after DetectClusterType — the group-level generic gate demanded Docker/
+	// k3d/helm even for cloud clusters (which need terraform + the cloud CLI)
+	// and could install tools as a side effect of a delete. After the
+	// confirmations on purpose: a declined destroy must not install anything.
+	if err := prerequisites.CheckForClusterType(clusterType); err != nil {
+		return sharedErrors.HandleGlobalError(err, globalFlags.Global.Verbose)
+	}
+
 	// Execute cluster deletion through service layer
 	err = service.DeleteCluster(cmd.Context(), clusterName, clusterType, globalFlags.Delete.Force)
 	if err != nil {
@@ -90,6 +131,6 @@ func runDeleteCluster(cmd *cobra.Command, args []string) error {
 	}
 
 	// Show friendly success message
-	operationsUI.ShowOperationSuccess("delete", clusterName)
+	operationsUI.ShowOperationSuccess("delete", clusterName, clusterType)
 	return nil
 }

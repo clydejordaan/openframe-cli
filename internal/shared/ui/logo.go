@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"os"
 	"strings"
+	"unicode/utf8"
 
 	"github.com/pterm/pterm"
 )
@@ -14,12 +15,10 @@ const (
 	logoTitle         = "OpenFrame Platform Bootstrapper"
 	borderChar        = "━"
 	topLeftCorner     = "┏"
-	topRightCorner    = "┖"
+	topRightCorner    = "┓"
 	bottomLeftCorner  = "┗"
 	bottomRightCorner = "┛"
 	verticalChar      = "┃"
-	borderLength      = 84
-	logoLeftPadding   = 2
 )
 
 var (
@@ -107,11 +106,16 @@ func showFancyLogo() {
 	// Use pterm default box with custom styling
 	pterm.DefaultBox.BoxStyle = boxStyle
 
-	// Create padded logo lines
+	// Create padded logo lines with a vertical cyan→purple gradient. pterm
+	// downsamples RGB on terminals without truecolor, so this is safe
+	// everywhere colors are safe at all.
+	gradStart := pterm.NewRGB(0, 200, 255)
+	gradEnd := pterm.NewRGB(168, 108, 255)
 	paddedLines := make([]string, 0, len(logoArt)+3)
 	paddedLines = append(paddedLines, "") // Top padding
-	for _, line := range logoArt {
-		paddedLines = append(paddedLines, " "+line+" ")
+	for i, line := range logoArt {
+		c := gradStart.Fade(0, float32(len(logoArt)-1), float32(i), gradEnd)
+		paddedLines = append(paddedLines, " "+c.Sprint(line)+" ")
 	}
 	paddedLines = append(paddedLines, "") // Bottom padding
 
@@ -129,30 +133,34 @@ func showFancyLogo() {
 	fmt.Println()
 }
 
+// plainLogoLines builds the plain-text logo box. Every width is derived from
+// the art itself — hardcoded border lengths previously disagreed with the art
+// width (88 vs 84 vs 82 runes), rendering the box broken.
+func plainLogoLines() []string {
+	// All art lines share one width; pad one space each side, plus the borders.
+	inner := utf8.RuneCountInString(logoArt[0]) + 2
+
+	// Center the title in the top border.
+	titleSegment := "┫ " + logoTitle + " ┣"
+	fill := inner - utf8.RuneCountInString(titleSegment)
+	topBorder := topLeftCorner + strings.Repeat(borderChar, fill/2) + titleSegment + strings.Repeat(borderChar, fill-fill/2) + topRightCorner
+
+	middleSeparator := verticalChar + strings.Repeat("─", inner) + verticalChar
+	bottomBorder := bottomLeftCorner + strings.Repeat(borderChar, inner) + bottomRightCorner
+
+	lines := make([]string, 0, len(logoArt)+4)
+	lines = append(lines, topBorder, middleSeparator)
+	for _, line := range logoArt {
+		lines = append(lines, verticalChar+" "+line+" "+verticalChar)
+	}
+	lines = append(lines, middleSeparator, bottomBorder)
+	return lines
+}
+
 // showPlainLogo displays a simple plain text logo for non-terminal environments
 func showPlainLogo() {
-	// Create a more sophisticated box design
-	logoVisualWidth := 84
-
-	// Build top border with title
-	topBorder := topLeftCorner + strings.Repeat(borderChar, 25) + "┫ " + logoTitle + " ┣" + strings.Repeat(borderChar, 26) + topRightCorner
-
-	// Build middle separator
-	middleSeparator := verticalChar + strings.Repeat("─", logoVisualWidth-2) + verticalChar
-
-	// Build bottom border
-	bottomBorder := bottomLeftCorner + strings.Repeat(borderChar, logoVisualWidth-2) + bottomRightCorner
-
-	// Print the logo with improved formatting
-	fmt.Println(topBorder)
-	fmt.Println(middleSeparator)
-
-	// Display logo art with proper padding
-	for _, line := range logoArt {
-		fmt.Printf("%s %s %s\n", verticalChar, line, verticalChar)
+	for _, line := range plainLogoLines() {
+		fmt.Println(line)
 	}
-
-	fmt.Println(middleSeparator)
-	fmt.Println(bottomBorder)
 	fmt.Println()
 }

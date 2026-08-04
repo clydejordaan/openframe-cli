@@ -8,6 +8,7 @@ package download
 
 import (
 	"archive/tar"
+	"archive/zip"
 	"bytes"
 	"compress/gzip"
 	"context"
@@ -28,6 +29,11 @@ import (
 // oversized response cannot exhaust memory before the checksum runs.
 const maxAssetBytes = 512 << 20 // 512 MiB
 
+// maxExtractBytes bounds a single archive member's decompressed size
+// (decompression-bomb guard). A var, not a const, so the boundary test can
+// lower it instead of building a 200 MiB archive.
+var maxExtractBytes int64 = 200 << 20 // 200 MiB
+
 // PinnedAsset is a single platform's download, pinned to a content digest.
 type PinnedAsset struct {
 	URL    string
@@ -44,6 +50,9 @@ type PinnedTool struct {
 	// extracted from the archive member "<GOOS>-<GOARCH>/<Name>" (the layout
 	// helm and many Go tools ship). Bare-binary tools leave this false.
 	Tarball bool
+	// Zip marks the assets as .zip archives with the bare binary named <Name>
+	// at the archive root (the layout HashiCorp releases ship, e.g. terraform).
+	Zip bool
 }
 
 // Asset returns the pinned asset for the given platform.
@@ -103,7 +112,18 @@ func (d Downloader) FetchVerified(ctx context.Context, asset PinnedAsset) ([]byt
 	// Cap the read so a misbehaving/oversized response can't exhaust memory. The
 	// pinned assets (tool binaries / archives) are tens of MB; 512 MiB is a
 	// generous ceiling. Read one byte past to detect an over-cap body.
-	body, err := io.ReadAll(io.LimitReader(resp.Body, maxAssetBytes+1))
+	src := io.LimitReader(resp.Body, maxAssetBytes+1)
+	label := assetLabel(asset.URL)
+	if progressEnabled() {
+		pr := newProgressReader(src, label, resp.ContentLength)
+		defer pr.done()
+		src = pr
+	} else if announceEnabled() {
+		announceStart(label, resp.ContentLength)
+		start := time.Now()
+		defer func() { announceDone(label, time.Since(start)) }()
+	}
+	body, err := io.ReadAll(src)
 	if err != nil {
 		return nil, fmt.Errorf("reading download body: %w", err)
 	}
@@ -142,6 +162,21 @@ func (d Downloader) InstallVerifiedTarGz(ctx context.Context, asset PinnedAsset,
 	return writeFileAtomic(extracted, destPath, perm)
 }
 
+// InstallVerifiedZipMember downloads and verifies a .zip asset, extracts the
+// regular file named member (a slash path within the archive, e.g.
+// "terraform"), and installs it to destPath with mode perm (atomic).
+func (d Downloader) InstallVerifiedZipMember(ctx context.Context, asset PinnedAsset, member, destPath string, perm os.FileMode) error {
+	body, err := d.FetchVerified(ctx, asset)
+	if err != nil {
+		return err
+	}
+	extracted, err := extractZipMember(body, member)
+	if err != nil {
+		return err
+	}
+	return writeFileAtomic(extracted, destPath, perm)
+}
+
 // FetchVerifiedTarGzMember downloads and verifies a .tar.gz asset and returns
 // the bytes of the regular file named member — for callers that stream the
 // binary elsewhere (e.g. into WSL via stdin) instead of installing it locally.
@@ -174,13 +209,50 @@ func extractTarGzMember(data []byte, member string) ([]byte, error) {
 		if hdr.Typeflag != tar.TypeReg || path.Clean(hdr.Name) != want {
 			continue
 		}
-		// Cap extraction to guard against a decompression bomb.
-		b, err := io.ReadAll(io.LimitReader(tr, 200<<20))
+		// Cap extraction to guard against a decompression bomb. Read one byte
+		// past the cap: a bare LimitReader EOFs silently at the boundary, which
+		// would install a truncated binary instead of failing.
+		b, err := io.ReadAll(io.LimitReader(tr, maxExtractBytes+1))
 		if err != nil {
 			return nil, fmt.Errorf("extracting %q: %w", member, err)
 		}
+		if int64(len(b)) > maxExtractBytes {
+			return nil, fmt.Errorf("extracting %q: member exceeds the %d-byte cap", member, maxExtractBytes)
+		}
 		return b, nil
 	}
+}
+
+// extractZipMember returns the bytes of the regular file named member inside a
+// zip archive. The member is matched by its cleaned path.
+func extractZipMember(data []byte, member string) ([]byte, error) {
+	zr, err := zip.NewReader(bytes.NewReader(data), int64(len(data)))
+	if err != nil {
+		return nil, fmt.Errorf("opening zip: %w", err)
+	}
+	want := path.Clean(member)
+	for _, f := range zr.File {
+		if f.Mode().IsRegular() && path.Clean(f.Name) == want {
+			rc, err := f.Open()
+			if err != nil {
+				return nil, fmt.Errorf("extracting %q: %w", member, err)
+			}
+			defer func() { _ = rc.Close() }()
+			// Cap extraction to guard against a decompression bomb. Read one
+			// byte past the cap: a bare LimitReader EOFs silently at the
+			// boundary, which would install a truncated binary instead of
+			// failing.
+			b, err := io.ReadAll(io.LimitReader(rc, maxExtractBytes+1))
+			if err != nil {
+				return nil, fmt.Errorf("extracting %q: %w", member, err)
+			}
+			if int64(len(b)) > maxExtractBytes {
+				return nil, fmt.Errorf("extracting %q: member exceeds the %d-byte cap", member, maxExtractBytes)
+			}
+			return b, nil
+		}
+	}
+	return nil, fmt.Errorf("member %q not found in archive", member)
 }
 
 // writeFileAtomic writes body to destPath with mode perm via a temp file in the

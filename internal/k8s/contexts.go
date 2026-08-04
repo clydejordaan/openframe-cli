@@ -7,11 +7,13 @@
 package k8s
 
 import (
+	"fmt"
 	"os"
 	"path/filepath"
 	"sort"
 
 	"k8s.io/client-go/tools/clientcmd"
+	clientcmdapi "k8s.io/client-go/tools/clientcmd/api"
 )
 
 // ContextInfo describes a single kubeconfig context.
@@ -57,11 +59,90 @@ func ResolveContextForCluster(kubeconfigPath, clusterName string) string {
 	return k3d
 }
 
-// LoadContexts reads the kubeconfig at path and returns its contexts (sorted by
+// HasContext reports whether the kubeconfig at path contains a context with
+// the given name. An unreadable kubeconfig counts as "no".
+func HasContext(path, name string) bool {
+	contexts, _, err := LoadContexts(path)
+	if err != nil {
+		return false
+	}
+	for _, c := range contexts {
+		if c.Name == name {
+			return true
+		}
+	}
+	return false
+}
+
+// SwitchContext sets current-context in the kubeconfig at path. It only
+// changes the pointer — never contexts, clusters, or users — so it cannot
+// damage entries owned by other tools. The context is looked up in the merged
+// view of a $KUBECONFIG list, but the pointer is written into a single file
+// following kubectl's rule: the first file in the list that already sets
+// current-context, else the first file that exists.
+func SwitchContext(path, name string) error {
+	cfg, err := loadMerged(path)
+	if err != nil {
+		return fmt.Errorf("loading kubeconfig: %w", err)
+	}
+	if _, ok := cfg.Contexts[name]; !ok {
+		return fmt.Errorf("kubeconfig has no context '%s'", name)
+	}
+	target, err := currentContextFile(path)
+	if err != nil {
+		return err
+	}
+	// Reload just the target file so only its current-context changes —
+	// writing the merged view would copy other files' entries into it.
+	fileCfg, err := clientcmd.LoadFromFile(target)
+	if err != nil {
+		return fmt.Errorf("loading kubeconfig: %w", err)
+	}
+	fileCfg.CurrentContext = name
+	if err := clientcmd.WriteToFile(*fileCfg, target); err != nil {
+		return fmt.Errorf("writing kubeconfig: %w", err)
+	}
+	return nil
+}
+
+// loadMerged loads path as a kubeconfig, honoring the kubectl convention that
+// $KUBECONFIG may be a list of files (OS path-list separator): entries are
+// merged first-wins and missing files are tolerated. A single path keeps the
+// strict LoadFromFile behavior — callers (and their fallbacks) rely on a
+// missing or unreadable file being an error.
+func loadMerged(path string) (*clientcmdapi.Config, error) {
+	files := filepath.SplitList(path)
+	if len(files) <= 1 {
+		return clientcmd.LoadFromFile(path)
+	}
+	rules := &clientcmd.ClientConfigLoadingRules{Precedence: files}
+	return rules.Load()
+}
+
+// currentContextFile picks the file in a $KUBECONFIG list that owns
+// current-context, per kubectl: the first file that already sets it, else the
+// first existing file. For a single existing path this is that path.
+func currentContextFile(path string) (string, error) {
+	files := filepath.SplitList(path)
+	for _, f := range files {
+		if cfg, err := clientcmd.LoadFromFile(f); err == nil && cfg.CurrentContext != "" {
+			return f, nil
+		}
+	}
+	for _, f := range files {
+		if _, err := os.Stat(f); err == nil {
+			return f, nil
+		}
+	}
+	return "", fmt.Errorf("no kubeconfig file in %q exists", path)
+}
+
+// LoadContexts reads the kubeconfig at path — which may be a $KUBECONFIG-style
+// list of files, merged like kubectl does — and returns its contexts (sorted by
 // name) together with the current-context name. This is what the interactive
 // context-selection menu is built on.
 func LoadContexts(path string) (contexts []ContextInfo, current string, err error) {
-	cfg, err := clientcmd.LoadFromFile(path)
+	cfg, err := loadMerged(path)
 	if err != nil {
 		return nil, "", err
 	}

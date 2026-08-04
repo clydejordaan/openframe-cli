@@ -384,23 +384,40 @@ func (e *RealCommandExecutor) ExecuteWithOptions(ctx context.Context, options Ex
 		cmd.Stdin = bytes.NewReader(options.Stdin)
 	}
 
-	// Execute the command
-	stdout, err := cmd.Output()
+	// Execute the command with explicit stdout/stderr buffers. cmd.Output()
+	// only surfaces stderr through *exec.ExitError, i.e. exclusively on
+	// failure — a successful run's stderr (helm deprecation/ownership
+	// warnings, gcloud notices) was silently dropped, leaving the callers'
+	// "show stderr in verbose mode" branches dead.
+	var stdoutBuf, stderrBuf bytes.Buffer
+	cmd.Stdout = &stdoutBuf
+	cmd.Stderr = &stderrBuf
+	err := cmd.Run()
 	result.Duration = time.Since(start)
-	result.Stdout = string(stdout)
+	result.Stdout = stdoutBuf.String()
+	// Redact at the population chokepoint: callers embed Stderr in
+	// user-facing errors even in non-verbose mode (e.g. the helm
+	// manager's "Helm output: %s"), and a child process can echo a
+	// token back. Control-flow substring checks downstream match
+	// generic phrases, never secret values, so redaction is safe here.
+	result.Stderr = redact.Redact(stderrBuf.String())
 
 	if err != nil {
 		var exitError *exec.ExitError
 		if errors.As(err, &exitError) {
 			result.ExitCode = exitError.ExitCode()
-			// Redact at the population chokepoint: callers embed Stderr in
-			// user-facing errors even in non-verbose mode (e.g. the helm
-			// manager's "Helm output: %s"), and a child process can echo a
-			// token back. Control-flow substring checks downstream match
-			// generic phrases, never secret values, so redaction is safe here.
-			result.Stderr = redact.Redact(string(exitError.Stderr))
 		} else {
 			result.ExitCode = -1
+		}
+
+		// A cancelled/expired context kills the child, but the exec error only
+		// says "signal: killed" — it never wraps ctx.Err(). Downstream both the
+		// Ctrl-C detection (errors.Is(err, context.Canceled)) and the retry
+		// classifier (errors.Is(err, context.DeadlineExceeded)) depend on the
+		// ctx error being in the chain, so join it in here. ctx is already the
+		// timeout-derived context when options.Timeout > 0.
+		if ctxErr := ctx.Err(); ctxErr != nil {
+			err = fmt.Errorf("%w (%w)", err, ctxErr)
 		}
 
 		// Log error in verbose mode. pterm.Debug, not fmt.Printf: the latter
@@ -426,8 +443,12 @@ func (e *RealCommandExecutor) ExecuteWithOptions(ctx context.Context, options Ex
 				errorOutput = result.Stdout
 			}
 
-			// Detect WSL distribution not found error
-			if result.ExitCode == WSLExitCodeDistroNotFound || result.ExitCode == -1 {
+			// Detect WSL distribution not found error. -1 only means "child
+			// killed by the WSL layer" when the command actually ran and died
+			// (*exec.ExitError); it is also the catch-all for errors like
+			// exec.ErrNotFound, where a WSL diagnosis would misreport a plain
+			// "helm not on PATH" as a missing distro.
+			if result.ExitCode == WSLExitCodeDistroNotFound || (result.ExitCode == -1 && exitError != nil) {
 				wslErr := &WSLError{
 					Operation:  fmt.Sprintf("executing %s", options.Command),
 					ExitCode:   result.ExitCode,

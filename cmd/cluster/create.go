@@ -1,12 +1,23 @@
 package cluster
 
 import (
+	"context"
 	"fmt"
+	"os"
+	osexec "os/exec"
 	"strings"
 
+	"github.com/flamingo-stack/openframe-cli/internal/cluster/discovery"
 	"github.com/flamingo-stack/openframe-cli/internal/cluster/models"
+	"github.com/flamingo-stack/openframe-cli/internal/cluster/prerequisites"
+	infracostinstall "github.com/flamingo-stack/openframe-cli/internal/cluster/prerequisites/infracost"
+	"github.com/flamingo-stack/openframe-cli/internal/cluster/provider"
+	"github.com/flamingo-stack/openframe-cli/internal/cluster/providers/terraform"
 	"github.com/flamingo-stack/openframe-cli/internal/cluster/ui"
 	"github.com/flamingo-stack/openframe-cli/internal/cluster/utils"
+	"github.com/flamingo-stack/openframe-cli/internal/shared/executor"
+	sharedUI "github.com/flamingo-stack/openframe-cli/internal/shared/ui"
+	"github.com/pterm/pterm"
 	"github.com/spf13/cobra"
 )
 
@@ -23,16 +34,24 @@ By default, shows a selection menu where you can choose:
 1. Quick start with defaults (press Enter) - creates cluster with default settings
 2. Interactive configuration wizard - step-by-step cluster customization
 
-Creates a local cluster for OpenFrame development. If a cluster with the same
-name already exists it is left untouched and reused — delete it first to start
-from scratch. Use the bootstrap command to install OpenFrame components after
-creation.
+Creates a local k3d cluster or a cloud GKE/EKS cluster for OpenFrame. If a
+cluster with the same name already exists it is left untouched and reused —
+delete it first to start from scratch. Use the bootstrap command to install
+OpenFrame components after creation.
+
+Cloud clusters are provisioned with Terraform (installed automatically) and
+create cloud resources that incur costs; the workspace and state live under
+~/.openframe/clusters/<name>. A failed create can be re-run to resume, or
+torn down with 'openframe cluster delete'.
 
 Examples:
   openframe cluster create                    # Show creation mode selection
   openframe cluster create my-cluster        # Show selection with custom name
   openframe cluster create --skip-wizard     # Direct creation with defaults
-  openframe cluster create --nodes 3 --type k3d --skip-wizard`,
+  openframe cluster create --nodes 3 --type k3d --skip-wizard
+  openframe cluster create my-gke --type gke --project my-project --region us-central1 --skip-wizard
+  openframe cluster create my-eks --type eks --region us-east-1 --skip-wizard
+  openframe cluster create my-eks --type eks --region us-east-1 --profile staging --skip-wizard`,
 		Args: cobra.MaximumNArgs(1),
 		PreRunE: func(cmd *cobra.Command, args []string) error {
 			utils.SyncGlobalFlags()
@@ -55,6 +74,143 @@ Examples:
 	}
 
 	return createCmd
+}
+
+// planPreviewFn is the cloud dry-run implementation. A package variable so
+// cmd-layer tests can stub it out: the real one shells out to terraform,
+// which unit tests must never do.
+var planPreviewFn = cloudPlanPreview
+
+// cloudPlanPreview runs a real terraform plan for a cloud config and prints
+// the resource footprint. Terraform not being installed is a soft skip — the
+// prerequisite gate only runs on a real create, and a dry-run must not
+// install anything.
+func cloudPlanPreview(ctx context.Context, config models.ClusterConfig) error {
+	if _, err := terraform.FindTerraform(); err != nil {
+		pterm.Info.Println("terraform is not installed — skipping the plan preview (it installs automatically on a real create)")
+		return nil
+	}
+
+	exec := executor.NewRealCommandExecutor(false, utils.GetGlobalFlags().Global.Verbose)
+	p, err := provider.New(config.Type, exec)
+	if err != nil {
+		return err
+	}
+	planner, ok := p.(provider.Planner)
+	if !ok {
+		return nil
+	}
+
+	if config.Type == models.ClusterTypeGKE {
+		if err := discovery.NewAuthFlow(exec).Ensure(ctx, true); err != nil {
+			return err
+		}
+	}
+	// The dry-run plan authenticates against AWS too — vet/announce the
+	// identity the same way the real create does.
+	if config.Type == models.ClusterTypeEKS {
+		if err := confirmAWSIdentity(ctx, exec, config.Cloud.Profile); err != nil {
+			return err
+		}
+	}
+
+	pterm.Info.Printf("Computing terraform plan for %s cluster '%s'...\n", config.Type, config.Name)
+	summary, err := planner.PlanCluster(ctx, config)
+	if err != nil {
+		return err
+	}
+	if !summary.HasChanges() {
+		pterm.Success.Println("Plan: no changes — the cluster already matches this configuration")
+		return nil
+	}
+	terraform.RenderPlanDiff(summary)
+	showCostEstimate(ctx, exec, config, summary)
+	return nil
+}
+
+// Seams for hermetic tests: availability probes the real PATH, the offer runs
+// a real verified download, and the login launches a real browser flow — none
+// of that may happen in unit tests.
+var (
+	infracostAvailableFn = terraform.InfracostAvailable
+	infracostOfferFn     = offerInfracostInstall
+	infracostLoginFn     = offerInfracostLogin
+)
+
+// offerInfracostLogin runs the one-time `infracost auth login` (browser flow)
+// right inside the CLI, so the user never needs a separate console. Attached
+// straight to the terminal — the flow prints a URL and reads stdin, which the
+// capturing executor would swallow. Returns whether a login was performed.
+func offerInfracostLogin() bool {
+	if sharedUI.IsNonInteractive() {
+		return false
+	}
+	confirmed, err := sharedUI.ConfirmActionInteractive(
+		"infracost needs a one-time free API key. Run 'infracost auth login' now (opens a browser)?", true)
+	if err != nil || !confirmed {
+		return false
+	}
+	login := osexec.Command("infracost", "auth", "login")
+	login.Stdin = os.Stdin
+	login.Stdout = os.Stdout
+	login.Stderr = os.Stderr
+	if err := login.Run(); err != nil {
+		pterm.Warning.Printf("infracost auth login failed: %v\n", err)
+		return false
+	}
+	return true
+}
+
+// offerInfracostInstall proposes the verified pinned infracost install in an
+// interactive session. It returns whether infracost is available afterwards.
+// The API key stays the user's one manual step: `infracost auth login`.
+func offerInfracostInstall() bool {
+	if sharedUI.IsNonInteractive() {
+		return false
+	}
+	confirmed, err := sharedUI.ConfirmActionInteractive(
+		"Install infracost (verified download) to see a monthly cost estimate?", true)
+	if err != nil || !confirmed {
+		return false
+	}
+	if err := infracostinstall.NewInstaller().Install(); err != nil {
+		pterm.Warning.Printf("infracost install failed: %v\n", err)
+		pterm.Info.Println("This is usually a transient network/DNS issue — re-running create will retry the download")
+		return false
+	}
+	return infracostAvailableFn()
+}
+
+// showCostEstimate prints a monthly estimate when infracost is available and
+// working — offering to install it first in interactive sessions. Otherwise
+// it prints NO figures, only the abstract cost warning with the provider's
+// pricing page. Best-effort either way: cost information never fails the
+// preview.
+func showCostEstimate(ctx context.Context, exec executor.CommandExecutor, config models.ClusterConfig, summary terraform.PlanSummary) {
+	available := infracostAvailableFn()
+	if !available {
+		available = infracostOfferFn()
+	}
+	if available {
+		cost, err := terraform.EstimateMonthlyCost(ctx, exec, summary.PlanJSON)
+		if err != nil && infracostLoginFn() {
+			// The usual failure is the missing (free) API key. The login just
+			// ran inside the CLI — retry once.
+			cost, err = terraform.EstimateMonthlyCost(ctx, exec, summary.PlanJSON)
+		}
+		if err == nil {
+			pterm.Info.Printf("Estimated monthly cost (infracost): %s\n", cost)
+			return
+		}
+		pterm.Info.Println("Cost estimate unavailable — run 'infracost auth login' (free, one-time) and re-run")
+		if utils.GetGlobalFlags().Global.Verbose {
+			pterm.Debug.Printf("infracost estimate error: %v\n", err)
+		}
+		pterm.Info.Println(ui.CostHint(config.Type))
+		return
+	}
+	pterm.Info.Println(ui.CostHint(config.Type))
+	pterm.Info.Println("Tip: install infracost (https://www.infracost.io/docs/) to see a monthly cost estimate here")
 }
 
 func runCreateCluster(cmd *cobra.Command, args []string) error {
@@ -106,6 +262,18 @@ func runCreateCluster(cmd *cobra.Command, args []string) error {
 			nodeCount = 3
 		}
 
+		// An explicit --min-nodes/--max-nodes 0 used to be silently replaced by
+		// the terraform template defaults (1/4): `omitempty` drops zeros from the
+		// generated tfvars, so the flag value never reached terraform. A zero
+		// bound is not supported — reject it loudly instead of provisioning
+		// something other than what was asked. Unset keeps the template default.
+		if cmd.Flags().Changed("min-nodes") && globalFlags.Create.MinNodes == 0 {
+			return fmt.Errorf("--min-nodes must be at least 1 (a zero-node floor is not supported; omit the flag for the default of 1)")
+		}
+		if cmd.Flags().Changed("max-nodes") && globalFlags.Create.MaxNodes == 0 {
+			return fmt.Errorf("--max-nodes must be at least 1 (omit the flag for the default of 4)")
+		}
+
 		config = models.ClusterConfig{
 			Name:       clusterName,
 			Type:       models.ClusterType(globalFlags.Create.ClusterType),
@@ -117,6 +285,23 @@ func runCreateCluster(cmd *cobra.Command, args []string) error {
 		if config.Type == "" {
 			config.Type = models.ClusterTypeK3d
 		}
+
+		// Cloud settings only exist for cloud types; the k3d backend rejects a
+		// non-nil Cloud by design.
+		if config.Type == models.ClusterTypeEKS || config.Type == models.ClusterTypeGKE {
+			cf := globalFlags.Create
+			config.Cloud = &models.CloudConfig{
+				Region:        cf.Region,
+				Profile:       cf.Profile,
+				Project:       cf.Project,
+				MachineType:   cf.MachineType,
+				MinNodes:      cf.MinNodes,
+				MaxNodes:      cf.MaxNodes,
+				Spot:          cf.Spot,
+				HA:            cf.HA,
+				BackendConfig: cf.BackendConfig,
+			}
+		}
 	}
 
 	// Show configuration summary for dry-run or skip-wizard modes
@@ -124,9 +309,48 @@ func runCreateCluster(cmd *cobra.Command, args []string) error {
 		operationsUI := ui.NewOperationsUI()
 		operationsUI.ShowConfigurationSummary(config, globalFlags.Create.DryRun, globalFlags.Create.SkipWizard)
 
-		// If dry-run, don't actually create the cluster
+		// If dry-run, don't actually create the cluster. For cloud types the
+		// dry-run is a real terraform plan of what create would provision.
 		if globalFlags.Create.DryRun {
+			if config.Type == models.ClusterTypeEKS || config.Type == models.ClusterTypeGKE {
+				return planPreviewFn(cmd.Context(), config)
+			}
 			return nil
+		}
+	}
+
+	// Type-aware prerequisite gate: runs after the type is known (wizard or
+	// flags), so only the tools the chosen backend needs are demanded. It sits
+	// after the dry-run return on purpose — the gate may INSTALL tools, and
+	// dry-run must not mutate the system.
+	if err := prerequisites.CheckForClusterType(config.Type); err != nil {
+		return err
+	}
+
+	// Single identity flow for EKS (the GKE twin is the AuthFlow below): vet
+	// WHICH AWS account the create is about to bill — confirmed interactively,
+	// announced non-interactively, and an actionable setup-guide error when no
+	// AWS configuration exists at all.
+	if config.Type == models.ClusterTypeEKS {
+		if err := confirmAWSIdentity(cmd.Context(), utils.CommandExecutor(), config.Cloud.Profile); err != nil {
+			return err
+		}
+	}
+
+	// Single auth flow: for GKE, offer `gcloud auth login` (+ ADC for
+	// terraform) right here instead of failing later in the provider
+	// preflight with a "run this command" error.
+	if config.Type == models.ClusterTypeGKE {
+		if err := discovery.NewAuthFlow(utils.CommandExecutor()).Ensure(cmd.Context(), true); err != nil {
+			return err
+		}
+		// In flag mode the project came from --project, not the wizard's
+		// validated picker, so check it against the accessible projects and fail
+		// fast with the valid options — before terraform runs.
+		if globalFlags.Create.SkipWizard {
+			if err := validateGKEProjectFlag(cmd.Context(), utils.CommandExecutor(), config.Cloud.Project); err != nil {
+				return err
+			}
 		}
 	}
 
@@ -134,4 +358,25 @@ func runCreateCluster(cmd *cobra.Command, args []string) error {
 	// We ignore the returned rest.Config as it's not needed for standalone cluster creation
 	_, err := service.CreateCluster(cmd.Context(), config)
 	return err
+}
+
+// validateGKEProjectFlag checks a --project against the gcloud identity's
+// accessible projects and returns an actionable error (listing the valid
+// options) when it is not among them. Best-effort: if the projects cannot be
+// listed (permissions, network), it returns nil and defers to the provider
+// preflight's 'gcloud projects describe' accessibility check.
+func validateGKEProjectFlag(ctx context.Context, exec executor.CommandExecutor, project string) error {
+	projects, err := discovery.NewGKEDiscoverer(exec).AllProjects(ctx)
+	if err != nil || len(projects) == 0 {
+		return nil // can't enumerate — the provider preflight still validates access
+	}
+	for _, p := range projects {
+		if p == project {
+			return nil
+		}
+	}
+	if len(projects) > 15 {
+		return fmt.Errorf("GCP project %q is not among your %d accessible projects — run 'gcloud projects list' to see them", project, len(projects))
+	}
+	return fmt.Errorf("GCP project %q is not among your accessible projects: %s", project, strings.Join(projects, ", "))
 }

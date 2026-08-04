@@ -66,6 +66,21 @@ func TestShouldRetry_RetryableSubstringCaseInsensitive(t *testing.T) {
 		"non-retryable message must not retry")
 }
 
+// TestInstallationRetryPolicy_PendingHelmOperationNotRetried: with no
+// concurrent helm operator in this CLI, "another operation ... is in progress"
+// means a release wedged in pending-* by a killed run. Retrying hits the same
+// wedged release (the friendly hint says exactly that), so the pattern must
+// NOT be in the retryable set.
+func TestInstallationRetryPolicy_PendingHelmOperationNotRetried(t *testing.T) {
+	p := InstallationRetryPolicy()
+	err := errors.New("Error: UPGRADE FAILED: another operation (install/upgrade/rollback) is in progress")
+	assert.False(t, p.ShouldRetry(err, 0), "a wedged pending-* release cannot be cleared by retrying")
+
+	// Neighboring genuinely-transient helm conditions must keep retrying.
+	assert.True(t, p.ShouldRetry(errors.New("etcdserver: request timed out"), 0))
+	assert.True(t, p.ShouldRetry(errors.New("the server is currently unable to handle the request"), 0))
+}
+
 func TestGetDelay_JitterNeverNegativeOrBelowBase(t *testing.T) {
 	p := NewExponentialBackoffPolicy(10, time.Second)
 	p.MaxDelay = time.Hour
@@ -222,4 +237,46 @@ func TestInstallationRetryPolicy_DropsDeadHelm2Pattern(t *testing.T) {
 	}
 	assert.False(t, p.ShouldRetry(errors.New("network timeout"), 0),
 		"the phantom phrase must no longer be a retry trigger")
+}
+
+// wrapperErr mimics ChartError: a wrapper implementing RecoverableError whose
+// Recoverable defaults to false (i.e. "unclassified", not "forbidden").
+type wrapperErr struct {
+	msg         string
+	recoverable bool
+}
+
+func (w *wrapperErr) Error() string                { return w.msg }
+func (w *wrapperErr) IsRecoverable() bool          { return w.recoverable }
+func (w *wrapperErr) GetRetryAfter() time.Duration { return 0 }
+
+type nonRetryableErr struct{ msg string }
+
+func (n *nonRetryableErr) Error() string        { return n.msg }
+func (n *nonRetryableErr) IsNonRetryable() bool { return true }
+
+// An unmarked wrapper (Recoverable=false by default) must not veto the
+// transient classification: every install failure arrives wrapped in a
+// ChartError, so the early return made the policy's own retryable table
+// unreachable and MaxAttempts=3 a fiction.
+func TestShouldRetry_UnmarkedWrapperFallsThroughToClassification(t *testing.T) {
+	p := InstallationRetryPolicy().(*ExponentialBackoffPolicy)
+	err := &wrapperErr{msg: "installation failed for ArgoCD: connection refused"}
+	assert.True(t, p.ShouldRetry(err, 1),
+		"a transient cause behind an unmarked wrapper must be retried")
+}
+
+func TestShouldRetry_ExplicitlyRecoverableWins(t *testing.T) {
+	p := InstallationRetryPolicy().(*ExponentialBackoffPolicy)
+	err := &wrapperErr{msg: "some opaque failure", recoverable: true}
+	assert.True(t, p.ShouldRetry(err, 1))
+}
+
+// An explicit non-retryable marker beats even transient-looking text: the
+// app-wait failure embeds pod logs whose content routinely contains phrases
+// like "connection refused" — retrying it would reinstall ArgoCD.
+func TestShouldRetry_NonRetryableMarkerBeatsTransientText(t *testing.T) {
+	p := InstallationRetryPolicy().(*ExponentialBackoffPolicy)
+	err := &nonRetryableErr{msg: "waiting failed: pod log: connect: connection refused; i/o timeout"}
+	assert.False(t, p.ShouldRetry(err, 1))
 }

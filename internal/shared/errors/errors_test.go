@@ -219,6 +219,36 @@ func TestErrorHandler_HandleError_GenericError(t *testing.T) {
 	}
 }
 
+// resumeHintStub carries a resume hint the way the gke provider's error does.
+type resumeHintStub struct {
+	err  error
+	hint string
+}
+
+func (s resumeHintStub) Error() string      { return s.err.Error() }
+func (s resumeHintStub) Unwrap() error      { return s.err }
+func (s resumeHintStub) ResumeHint() string { return s.hint }
+
+// An interrupted operation carrying a resume hint must be classified as an
+// interruption AND run the hint-surfacing path without panicking (M2 wiring).
+func TestPrintInterruption_SurfacesResumeHint(t *testing.T) {
+	err := resumeHintStub{err: fmt.Errorf("apply: %w", context.Canceled), hint: "re-run create to resume"}
+
+	assert.True(t, NewErrorHandler(false).isUserInterruption(err),
+		"a context.Canceled chain must be treated as an interruption")
+
+	var rh interface{ ResumeHint() string }
+	assert.True(t, errors.As(err, &rh), "the hint must be discoverable the way printInterruption looks it up")
+
+	// pterm output isn't captured here (house convention); lock that the
+	// hint-carrying interruption path runs without panicking.
+	devNull, _ := os.Open(os.DevNull)
+	old := os.Stdout
+	os.Stdout = devNull
+	defer func() { os.Stdout = old }()
+	assert.NotPanics(t, func() { printInterruption(err) })
+}
+
 func TestErrorHandler_TypeAssertion(t *testing.T) {
 	handler := NewErrorHandler(true)
 
@@ -363,4 +393,35 @@ func BenchmarkErrorHandler_HandleError(b *testing.B) {
 	for i := 0; i < b.N; i++ {
 		handler.HandleError(err)
 	}
+}
+
+// The failure panel splits an error chain into headline + root cause.
+func TestSplitCause(t *testing.T) {
+	root := fmt.Errorf("quota exceeded")
+	wrapped := fmt.Errorf("create failed for cluster big: %w", root)
+	head, cause := splitCause(wrapped)
+	assert.Equal(t, "create failed for cluster big", head)
+	assert.Equal(t, "quota exceeded", cause)
+
+	// Two wrapping layers: headline keeps the whole outer chain, cause is root.
+	outer := fmt.Errorf("bootstrap failed: %w", wrapped)
+	head, cause = splitCause(outer)
+	assert.Equal(t, "bootstrap failed: create failed for cluster big", head)
+	assert.Equal(t, "quota exceeded", cause)
+
+	// A chain of one: first line is the headline, the rest is the cause block.
+	head, cause = splitCause(fmt.Errorf("apply failed\nstate kept in /tmp/x"))
+	assert.Equal(t, "apply failed", head)
+	assert.Equal(t, "state kept in /tmp/x", cause)
+
+	head, cause = splitCause(fmt.Errorf("plain"))
+	assert.Equal(t, "plain", head)
+	assert.Empty(t, cause)
+}
+
+func TestGenericHint_K3dCreateSpecialCase(t *testing.T) {
+	err := fmt.Errorf("cluster create operation failed: k3d cluster create demo: exit status 1")
+	hint := genericHint(err)
+	assert.Contains(t, hint, "docker info")
+	assert.Contains(t, hint, "6550")
 }

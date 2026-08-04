@@ -1,0 +1,116 @@
+package gke
+
+import (
+	_ "embed"
+	"fmt"
+	"regexp"
+	"strings"
+
+	"github.com/flamingo-stack/openframe-cli/internal/cluster/models"
+)
+
+// mainTF is the generated root module. It is static — all per-cluster values
+// travel through terraform.tfvars.json, so there is no HCL templating.
+//
+//go:embed templates/main.tf
+var mainTF []byte
+
+// tfvars mirrors the variables block of templates/main.tf.
+type tfvars struct {
+	ClusterName string `json:"cluster_name"`
+	Project     string `json:"project"`
+	Region      string `json:"region"`
+	// Regional is always emitted (not omitempty): the template default is zonal,
+	// and dropping a false here would be correct-by-accident — keep it explicit.
+	Regional          bool   `json:"regional"`
+	Zone              string `json:"zone,omitempty"`
+	KubernetesVersion string `json:"kubernetes_version,omitempty"`
+	InstanceType      string `json:"instance_type,omitempty"`
+	MinNodes          int    `json:"min_nodes,omitempty"`
+	MaxNodes          int    `json:"max_nodes,omitempty"`
+	DesiredNodes      int    `json:"desired_nodes,omitempty"`
+	Spot              bool   `json:"spot,omitempty"`
+}
+
+// gkeVersionRE matches the <major>.<minor> form GKE expects (e.g. "1.33").
+var gkeVersionRE = regexp.MustCompile(`^\d+\.\d+$`)
+
+// tfvarsFor maps a validated ClusterConfig onto the template variables.
+func tfvarsFor(config models.ClusterConfig) (tfvars, error) {
+	cloud := config.Cloud
+
+	version := strings.TrimPrefix(config.K8sVersion, "v")
+	if version == "latest" {
+		version = "" // template maps empty to the GKE default
+	}
+	if version != "" && !gkeVersionRE.MatchString(version) {
+		return tfvars{}, models.NewInvalidConfigError("version", config.K8sVersion,
+			"GKE expects <major>.<minor> (e.g. 1.33)")
+	}
+
+	return tfvars{
+		ClusterName:       config.Name,
+		Project:           cloud.Project,
+		Region:            cloud.Region,
+		Regional:          cloud.HA,
+		Zone:              cloud.Zone,
+		KubernetesVersion: version,
+		InstanceType:      cloud.MachineType,
+		MinNodes:          cloud.MinNodes,
+		MaxNodes:          effectiveMaxNodes(cloud.MaxNodes, config.NodeCount),
+		DesiredNodes:      config.NodeCount,
+		Spot:              cloud.Spot,
+	}, nil
+}
+
+// templateDefaultMaxNodes mirrors the max_nodes default in templates/main.tf.
+const templateDefaultMaxNodes = 4
+
+// effectiveMaxNodes keeps `--nodes` authoritative when --max-nodes is not
+// given: with max omitted from tfvars the template default (4) applies, and a
+// `--nodes 6` create would fail mid-apply (initial node count outside the
+// autoscaler bounds) after minutes of billed infrastructure — or silently be
+// scaled down, contradicting the flag. So an unset max grows to cover the
+// requested count; an explicit max is validated against it instead (validate).
+func effectiveMaxNodes(maxNodes, nodeCount int) int {
+	if maxNodes == 0 && nodeCount > templateDefaultMaxNodes {
+		return nodeCount
+	}
+	return maxNodes
+}
+
+// validate enforces the GKE-specific config invariants at the domain boundary.
+func validate(config models.ClusterConfig) error {
+	if err := models.ValidateClusterName(config.Name); err != nil {
+		return models.NewInvalidConfigError("name", config.Name, err.Error())
+	}
+	if config.Type != models.ClusterTypeGKE {
+		return models.NewProviderNotFoundError(config.Type)
+	}
+	if config.Cloud == nil || config.Cloud.Region == "" {
+		return models.NewInvalidConfigError("region", "", "a region is required for GKE clusters (--region)")
+	}
+	if config.Cloud.Project == "" {
+		return models.NewInvalidConfigError("project", "", "a GCP project is required for GKE clusters (--project)")
+	}
+	if config.NodeCount < 1 {
+		return models.NewInvalidConfigError("nodeCount", config.NodeCount, "node count must be at least 1")
+	}
+	c := config.Cloud
+	if c.MinNodes < 0 || c.MaxNodes < 0 {
+		return models.NewInvalidConfigError("nodes", fmt.Sprintf("min=%d max=%d", c.MinNodes, c.MaxNodes), "node bounds must not be negative")
+	}
+	if c.MinNodes > 0 && c.MaxNodes > 0 && c.MinNodes > c.MaxNodes {
+		return models.NewInvalidConfigError("nodes", fmt.Sprintf("min=%d max=%d", c.MinNodes, c.MaxNodes), "min nodes must not exceed max nodes")
+	}
+	// The desired count must sit inside the autoscaler bounds, or the node pool
+	// is rejected mid-apply — after the VPC, NAT, and control plane are already
+	// created and billed.
+	if c.MaxNodes > 0 && config.NodeCount > c.MaxNodes {
+		return models.NewInvalidConfigError("nodes", fmt.Sprintf("nodes=%d max=%d", config.NodeCount, c.MaxNodes), "node count must not exceed max nodes")
+	}
+	if c.MinNodes > 0 && config.NodeCount < c.MinNodes {
+		return models.NewInvalidConfigError("nodes", fmt.Sprintf("nodes=%d min=%d", config.NodeCount, c.MinNodes), "node count must not be below min nodes")
+	}
+	return nil
+}

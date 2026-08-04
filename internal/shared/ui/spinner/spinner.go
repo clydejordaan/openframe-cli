@@ -12,6 +12,7 @@ import (
 	"io"
 	"os"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/flamingo-stack/openframe-cli/internal/shared/ui"
@@ -32,6 +33,14 @@ const (
 
 var defaultFrames = []string{"⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"}
 
+// activeCount tracks running spinners process-wide so other line-rewriting UI
+// (e.g. the download progress bar) can yield the cursor line instead of
+// fighting the animation for it.
+var activeCount atomic.Int32
+
+// AnyActive reports whether any spinner is currently running.
+func AnyActive() bool { return activeCount.Load() > 0 }
+
 // Spinner is a race-free status spinner. The zero value is not usable; use New.
 type Spinner struct {
 	out      io.Writer
@@ -40,19 +49,22 @@ type Spinner struct {
 	interval time.Duration
 	frames   []string
 
-	showTimer bool
-
 	mu        sync.Mutex
 	text      string
 	active    bool
+	showTimer bool
 	startedAt time.Time
 	stopCh    chan struct{}
 	doneCh    chan struct{}
 }
 
-// WithTimer makes the spinner show elapsed time next to its text.
+// WithTimer makes the spinner show elapsed time next to its text. Guarded by
+// the mutex: callers may enable the timer after Start, while animate is
+// already reading the flag.
 func (s *Spinner) WithTimer() *Spinner {
+	s.mu.Lock()
 	s.showTimer = true
+	s.mu.Unlock()
 	return s
 }
 
@@ -78,6 +90,11 @@ func New() *Spinner {
 	s := NewWithWriter(os.Stdout)
 	if f, ok := any(os.Stdout).(*os.File); ok {
 		s.isTTY = term.IsTerminal(int(f.Fd()))
+	}
+	// --plain promises sequential output: keep the styled final lines but
+	// never animate over the cursor line.
+	if ui.IsPlain() {
+		s.isTTY = false
 	}
 	return s
 }
@@ -106,6 +123,7 @@ func (s *Spinner) Start(text string) {
 	s.startedAt = time.Now()
 	s.stopCh = make(chan struct{})
 	s.doneCh = make(chan struct{})
+	activeCount.Add(1)
 	s.mu.Unlock()
 
 	go s.animate()
@@ -148,9 +166,10 @@ func (s *Spinner) animate() {
 			s.mu.Lock()
 			text := s.text
 			started := s.startedAt
+			showTimer := s.showTimer
 			s.mu.Unlock()
 			if s.isTTY {
-				if s.showTimer {
+				if showTimer {
 					fmt.Fprintf(s.out, "\r%s %s (%s) ", s.frames[i%len(s.frames)], text, time.Since(started).Round(time.Second))
 				} else {
 					fmt.Fprintf(s.out, "\r%s %s ", s.frames[i%len(s.frames)], text)
@@ -170,6 +189,7 @@ func (s *Spinner) finish(text string, style finalStyle) {
 		return
 	}
 	s.active = false
+	activeCount.Add(-1)
 	stopCh, doneCh := s.stopCh, s.doneCh
 	s.mu.Unlock()
 

@@ -70,6 +70,26 @@ type Manager struct {
 	// to converge before triggering the next one. Zero means the default
 	// (defaultGroupWait). Tests set a tiny value for speed.
 	groupWait time.Duration
+
+	// crdWaitRetries bounds how many times waitForArgoCDReady polls for the
+	// ArgoCD CRD before giving up, one poll per podWaitInterval. Zero means the
+	// default (100, ~5 minutes at 3s). Tests set a tiny value for speed.
+	crdWaitRetries int
+
+	// podWaitTimeout bounds how long waitForArgoCDReady waits for the first
+	// ArgoCD pod to be created. Zero means the default (120s). Tests set a
+	// tiny value for speed.
+	podWaitTimeout time.Duration
+
+	// podWaitInterval is the poll interval waitForArgoCDReady uses between CRD
+	// and pod checks. Zero means the default (3s). Tests set a tiny value for
+	// speed.
+	podWaitInterval time.Duration
+
+	// podReadyTimeout bounds how long waitForArgoCDReady waits for the existing
+	// ArgoCD pods to all report Ready. Zero means the default (5m). Tests set a
+	// tiny value for speed.
+	podReadyTimeout time.Duration
 }
 
 // WithWaitTimeout sets a custom WaitForApplications timeout and returns the
@@ -238,6 +258,24 @@ type Application struct {
 	Path             string // Path in repository
 	TargetRevision   string // Target revision (branch/tag)
 	ReconciledAt     string // Last reconciliation time
+	Namespace        string // spec.destination.namespace — where this app's workloads run
+	// UnhealthyResources are the app's child resources whose own health is not
+	// Healthy (status.resources with a non-Healthy health.status). This is what
+	// names the failing Deployment/StatefulSet/child-Application INSIDE a
+	// Degraded app — the app-level health alone only says "something in here".
+	UnhealthyResources []ResourceIssue
+}
+
+// ResourceIssue is one child resource of an ArgoCD application that is not
+// Healthy, with ArgoCD's per-resource health message (which for a Deployment
+// carries e.g. "progress deadline exceeded", for a child Application the
+// downstream failure).
+type ResourceIssue struct {
+	Kind      string
+	Name      string
+	Namespace string
+	Health    string
+	Message   string
 }
 
 // argoApp represents the minimal ArgoCD application structure for JSON parsing.
@@ -265,9 +303,16 @@ type argoApp struct {
 			Message string `json:"message"`
 		} `json:"operationState"`
 		// Resources are the child resources planned/managed by an app (used to
-		// count Applications created by the app-of-apps).
+		// count Applications created by the app-of-apps, and to name the
+		// unhealthy children of a Degraded app).
 		Resources []struct {
-			Kind string `json:"kind"`
+			Kind      string `json:"kind"`
+			Name      string `json:"name"`
+			Namespace string `json:"namespace"`
+			Health    struct {
+				Status  string `json:"status"`
+				Message string `json:"message"`
+			} `json:"health"`
 		} `json:"resources"`
 		ReconciledAt string `json:"reconciledAt"`
 	} `json:"status"`
@@ -320,20 +365,38 @@ func applicationFromArgoApp(item argoApp) Application {
 		}
 	}
 
+	// Resources without a health block (ConfigMaps, Services, …) are fine by
+	// definition; only explicitly non-Healthy children are worth naming.
+	var unhealthy []ResourceIssue
+	for _, res := range item.Status.Resources {
+		if res.Health.Status == "" || res.Health.Status == "Healthy" {
+			continue
+		}
+		unhealthy = append(unhealthy, ResourceIssue{
+			Kind:      res.Kind,
+			Name:      res.Name,
+			Namespace: res.Namespace,
+			Health:    res.Health.Status,
+			Message:   res.Health.Message,
+		})
+	}
+
 	return Application{
-		Name:             item.Metadata.Name,
-		Health:           health,
-		HealthMessage:    item.Status.Health.Message,
-		Sync:             sync,
-		SyncRevision:     item.Status.Sync.Revision,
-		Condition:        condition,
-		ConditionType:    conditionType,
-		OperationPhase:   item.Status.OperationState.Phase,
-		OperationMessage: item.Status.OperationState.Message,
-		RepoURL:          item.Spec.Source.RepoURL,
-		Path:             item.Spec.Source.Path,
-		TargetRevision:   item.Spec.Source.TargetRevision,
-		ReconciledAt:     item.Status.ReconciledAt,
+		Name:               item.Metadata.Name,
+		Health:             health,
+		HealthMessage:      item.Status.Health.Message,
+		Sync:               sync,
+		SyncRevision:       item.Status.Sync.Revision,
+		Condition:          condition,
+		ConditionType:      conditionType,
+		OperationPhase:     item.Status.OperationState.Phase,
+		OperationMessage:   item.Status.OperationState.Message,
+		RepoURL:            item.Spec.Source.RepoURL,
+		Path:               item.Spec.Source.Path,
+		TargetRevision:     item.Spec.Source.TargetRevision,
+		ReconciledAt:       item.Status.ReconciledAt,
+		Namespace:          item.Spec.Destination.Namespace,
+		UnhealthyResources: unhealthy,
 	}
 }
 
@@ -457,7 +520,10 @@ func (m *Manager) DeleteApplications(ctx context.Context) (int, error) {
 	deleted := 0
 	for i := range list.Items {
 		name := list.Items[i].GetName()
-		if derr := res.Delete(ctx, name, metav1.DeleteOptions{}); derr != nil && !apierrors.IsNotFound(derr) {
+		if derr := res.Delete(ctx, name, metav1.DeleteOptions{}); derr != nil {
+			if apierrors.IsNotFound(derr) {
+				continue // vanished between List and Delete — nothing was deleted here
+			}
 			return deleted, fmt.Errorf("deleting application %q: %w", name, derr)
 		}
 		deleted++

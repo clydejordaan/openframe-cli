@@ -3,6 +3,7 @@ package argocd
 import (
 	"context"
 	"fmt"
+	"os"
 	"runtime"
 	"strings"
 	"sync"
@@ -87,12 +88,22 @@ func (m *Manager) WaitForApplications(ctx context.Context, config config.ChartIn
 		pterm.Debug.Println("  - Progress updates every 10 seconds in verbose mode")
 	}
 
-	// Start pterm spinner only if not in silent/non-interactive mode
+	// Display: the live dashboard (interactive terminal, non-verbose) shows
+	// the progress bar and per-app health in place; otherwise the spinner
+	// carries a one-line summary; --silent gets a single info line. Exactly
+	// one of dash/spinner is active — every site below guards on nil.
 	var spinner *uispinner.Spinner
-	if !config.Silent {
+	var dash *appDashboard
+	if !config.Silent && !config.Verbose {
+		dash = newAppDashboard()
+	}
+	switch {
+	case dash != nil:
+		dash.Update(0, 0, nil)
+	case !config.Silent:
 		spinner = uispinner.New().WithTimer()
 		spinner.Start("Installing ArgoCD applications...")
-	} else {
+	default:
 		// In non-interactive mode, just show a simple info message
 		pterm.Info.Println("Installing ArgoCD applications...")
 	}
@@ -100,8 +111,20 @@ func (m *Manager) WaitForApplications(ctx context.Context, config config.ChartIn
 	var spinnerMutex sync.Mutex
 	spinnerStopped := false
 
+	// waitNote routes one-off in-wait announcements: pinned under the live
+	// dashboard when it is active (a plain print would be visually swallowed
+	// by the area redraw within 2s), ordinary silence-aware prints otherwise.
+	waitNote := func(styled string) {
+		if dash != nil {
+			dash.Note(styled)
+			return
+		}
+		pterm.DefaultBasicText.Println(styled)
+	}
+
 	// Function to stop spinner safely
 	stopSpinner := func() {
+		dash.Stop()
 		spinnerMutex.Lock()
 		defer spinnerMutex.Unlock()
 		if !spinnerStopped && spinner != nil {
@@ -157,8 +180,15 @@ func (m *Manager) WaitForApplications(ctx context.Context, config config.ChartIn
 	startTime := time.Now()
 	timeout := m.waitTimeout
 	if timeout <= 0 {
-		timeout = 60 * time.Minute // default, sized for a fresh install
+		timeout = defaultAppWaitTimeout()
 	}
+	// Cap the budget to the caller's context deadline, with margin: the install
+	// path runs the WHOLE flow (ArgoCD install, clone, app-of-apps, this wait)
+	// under one 60m deadline, and this wait's own default is also 60m measured
+	// from a strictly later point — so the outer deadline always expired first
+	// and the diagnostic timeoutError below (not-ready apps, per-app health)
+	// was unreachable; users got a bare "context deadline exceeded".
+	timeout = capToDeadline(localCtx, timeout, startTime)
 	checkInterval := 2 * time.Second
 	lastCheck := time.Now()
 	clusterHealthCheckInterval := 10 * time.Second
@@ -175,7 +205,6 @@ func (m *Manager) WaitForApplications(ctx context.Context, config config.ChartIn
 	}
 
 	maxAppsSeenTotal := 0
-	maxAppsSeenReady := 0
 	consecutiveAllReady := 0
 	stabilizationChecks := m.StabilizationChecks
 	if stabilizationChecks <= 0 {
@@ -195,6 +224,11 @@ func (m *Manager) WaitForApplications(ctx context.Context, config config.ChartIn
 	// ref whose chart path does not exist at the pinned revision fails fast
 	// instead of riding the full timeout.
 	fatalManifest := newFatalManifestTracker()
+
+	// Terminally-Degraded app tracking (see degraded.go): an app that stays
+	// Degraded+Synced with a genuinely-stuck pod (CrashLoop / ImagePull) fails
+	// fast with that pod's crash logs, instead of hanging to the timeout.
+	degraded := newDegradedTracker()
 
 	// Repo-server issue tracking for recovery logic
 	repoServerRecoveryAttempts := 0
@@ -218,9 +252,12 @@ func (m *Manager) WaitForApplications(ctx context.Context, config config.ChartIn
 	// that never became ready. The loop had this all along and threw it away:
 	// "timeout waiting for ArgoCD applications after 1h0m0s" told the user
 	// nothing about which of the apps was stuck, or what to run next.
-	var lastNotReadyApps []string  // decorated "name (Health: X)" labels, for the list
-	var lastNotReadyNames []string // bare names, for the kubectl example
+	var lastNotReadyApps []string    // decorated "name (Health: X)" labels, for the list
+	var lastNotReadyNames []string   // bare names, for the kubectl example
+	var lastNotReadyDetails []string // per-app health messages, for the timeout diagnostic
+	var lastAppsSeen []Application   // full last parse, for the timeout workload diagnosis
 	lastReadyCount, lastTotalApps := 0, 0
+	heartbeatLastReady := 0
 	// The spinner already animates for interactive users, so the textual line is
 	// mainly a heartbeat for logs and CI; verbose users want it more often.
 	progressPrintInterval := 30 * time.Second
@@ -232,17 +269,39 @@ func (m *Manager) WaitForApplications(ctx context.Context, config config.ChartIn
 	for {
 		select {
 		case <-localCtx.Done():
+			// Last-known-state line for the sequential modes: a Ctrl+C or a
+			// cancelled CI job records where the install stood instead of
+			// ending on a bare "operation cancelled".
+			if dash == nil && lastTotalApps > 0 {
+				line := fmt.Sprintf("interrupted at %d/%d applications ready", lastReadyCount, lastTotalApps)
+				if len(lastNotReadyNames) > 0 {
+					line += fmt.Sprintf(" · pending: %s", strings.Join(lastNotReadyNames, ", "))
+				}
+				pterm.DefaultBasicText.Println(line)
+			}
 			return fmt.Errorf("operation cancelled: %w", localCtx.Err())
 		case <-ticker.C:
 			// Check timeout
 			if time.Since(startTime) > timeout {
+				dash.Fail(fmt.Sprintf("Timeout after %v", timeout))
 				spinnerMutex.Lock()
 				if !spinnerStopped && spinner != nil {
 					spinner.Fail(fmt.Sprintf("Timeout after %v", timeout))
 					spinnerStopped = true
 				}
 				spinnerMutex.Unlock()
-				return timeoutError(timeout, lastReadyCount, lastTotalApps, lastNotReadyApps, lastNotReadyNames)
+				// Deep workload diagnosis for the apps that never became ready:
+				// failing pods with reasons, their last crash-log lines, and
+				// recent warning events. This is the same inspection the
+				// Degraded fail-fast runs — the timeout path used to skip it,
+				// leaving only app-level health lines. Bounded (capToDeadline
+				// reserved a margin for exactly this) and best-effort.
+				workloadDiag := ""
+				if stuck := notReadyApplications(lastAppsSeen, maxAppsDiagnosedAtTimeout); len(stuck) > 0 {
+					pterm.Info.Printf("Collecting diagnostics for %d not-ready application(s)...\n", len(stuck))
+					workloadDiag, _ = m.diagnoseFailingApps(localCtx, stuck)
+				}
+				return timeoutError(timeout, lastReadyCount, lastTotalApps, lastNotReadyApps, lastNotReadyNames, lastNotReadyDetails, workloadDiag)
 			}
 
 			// Periodic cluster health check
@@ -275,12 +334,19 @@ func (m *Manager) WaitForApplications(ctx context.Context, config config.ChartIn
 						return fmt.Errorf("cluster became unreachable while waiting for applications: %w", err)
 					}
 
-					// Add exponential backoff delay between failures to avoid hammering WSL
+					// Add exponential backoff delay between failures to avoid hammering
+					// WSL. Ctx-aware: a plain Sleep here held Ctrl+C hostage for up to
+					// 10s per failure — exactly during the flaky-cluster episodes where
+					// users reach for it.
 					backoffDelay := time.Duration(consecutiveFailures) * 2 * time.Second
 					if backoffDelay > 10*time.Second {
 						backoffDelay = 10 * time.Second
 					}
-					time.Sleep(backoffDelay)
+					select {
+					case <-localCtx.Done():
+						return fmt.Errorf("operation cancelled: %w", localCtx.Err())
+					case <-time.After(backoffDelay):
+					}
 				} else {
 					consecutiveFailures = 0
 				}
@@ -339,12 +405,17 @@ func (m *Manager) WaitForApplications(ctx context.Context, config config.ChartIn
 						return fmt.Errorf("cluster became unreachable while waiting for applications: %w", err)
 					}
 
-					// Add backoff delay between failures
+					// Add backoff delay between failures. Ctx-aware for the same
+					// reason as the connectivity backoff above.
 					backoffDelay := time.Duration(consecutiveFailures) * 2 * time.Second
 					if backoffDelay > 10*time.Second {
 						backoffDelay = 10 * time.Second
 					}
-					time.Sleep(backoffDelay)
+					select {
+					case <-localCtx.Done():
+						return fmt.Errorf("operation cancelled: %w", localCtx.Err())
+					case <-time.After(backoffDelay):
+					}
 				}
 
 				// Retry on other errors (with normal interval via lastCheck)
@@ -353,7 +424,7 @@ func (m *Manager) WaitForApplications(ctx context.Context, config config.ChartIn
 
 			// Reset consecutive failures on successful query
 			if consecutiveFailures > 0 {
-				pterm.Success.Println("Application queries restored")
+				waitNote(pterm.Success.Sprint("Application queries restored"))
 				consecutiveFailures = 0
 			}
 
@@ -377,6 +448,8 @@ func (m *Manager) WaitForApplications(ctx context.Context, config config.ChartIn
 			notReadyApps := assess.notReady
 			lastNotReadyApps, lastReadyCount, lastTotalApps = notReadyApps, currentlyReady, totalApps
 			lastNotReadyNames = assess.notReadyNames
+			lastNotReadyDetails = notReadyDiagnostics(apps)
+			lastAppsSeen = apps
 
 			// Fail fast on deterministic manifest errors (see fatalmanifest.go):
 			// once an app has shown the same "content missing at this revision"
@@ -387,6 +460,7 @@ func (m *Manager) WaitForApplications(ctx context.Context, config config.ChartIn
 			// staleness checks use the same tick.
 			now := time.Now()
 			if fatal := fatalManifest.observe(apps, now); len(fatal) > 0 {
+				dash.Fail("Applications cannot render manifests from the deployed revision")
 				spinnerMutex.Lock()
 				if !spinnerStopped && spinner != nil {
 					spinner.Fail("Applications cannot render manifests from the deployed revision")
@@ -399,6 +473,26 @@ func (m *Manager) WaitForApplications(ctx context.Context, config config.ChartIn
 					requestedRef = config.AppOfApps.GitHubBranch
 				}
 				return fatalManifestError(requestedRef, fatal)
+			}
+
+			// Terminally-Degraded fail-fast: an app that has stayed Degraded+Synced
+			// long enough is only aborted once we confirm a genuinely-stuck pod
+			// (CrashLoop / ImagePull / repeated crashes) — so a slow-but-recovering
+			// workload is never cut off. The error carries the pod's crash logs and
+			// events, so it says WHY, not just that it hung.
+			if cand := degraded.observe(apps, now); len(cand) > 0 {
+				if diag, stuck := m.diagnoseFailingApps(localCtx, cand); len(stuck) > 0 {
+					dash.Fail("An application is Degraded with a workload that will not recover")
+					spinnerMutex.Lock()
+					if !spinnerStopped && spinner != nil {
+						spinner.Fail("An application is Degraded with a workload that will not recover")
+						spinnerStopped = true
+					}
+					spinnerMutex.Unlock()
+					// Only the apps whose OWN pods are terminally stuck — not
+					// every candidate that happens to share their namespace.
+					return degradedAppError(stuck, diag)
+				}
 			}
 
 			// Stall handling (finding N3, per-application): an app that has sat
@@ -415,21 +509,22 @@ func (m *Manager) WaitForApplications(ctx context.Context, config config.ChartIn
 				// which is exactly the path they are already on. Gating the hint on
 				// !stragglerSyncTriggered instead would print that contradictory
 				// advice on every stall tick after the one-shot sync.
+				stallNote := waitNote
 				if config.SyncStragglersOnStall {
 					if !stragglerSyncTriggered {
 						stragglerSyncTriggered = true
-						pterm.Warning.Printf("No progress for %s; triggering sync of %d OutOfSync application(s): %v\n",
-							stallAfter.Round(time.Second), len(stragglers), stragglers)
+						stallNote(pterm.Warning.Sprintf("No progress for %s; triggering sync of %d OutOfSync application(s): %v",
+							stallAfter.Round(time.Second), len(stragglers), stragglers))
 						patched, failedCount, syncErr := m.syncApplicationsByName(localCtx, stragglers, false)
 						if failedCount > 0 {
-							pterm.Warning.Printf("Straggler sync: %d triggered, %d failed (first error: %v)\n", patched, failedCount, syncErr)
+							stallNote(pterm.Warning.Sprintf("Straggler sync: %d triggered, %d failed (first error: %v)", patched, failedCount, syncErr))
 						}
 					}
 				} else if !stallHintShown {
 					stallHintShown = true
-					pterm.Warning.Printf("No progress for %s; %d application(s) are OutOfSync and may have auto-sync disabled: %v\n",
-						stallAfter.Round(time.Second), len(stragglers), stragglers)
-					pterm.Info.Println("They will not sync on their own — run `openframe app upgrade --sync` (or sync them in ArgoCD) to roll them out.")
+					stallNote(pterm.Warning.Sprintf("No progress for %s; %d application(s) are OutOfSync and may have auto-sync disabled: %v",
+						stallAfter.Round(time.Second), len(stragglers), stragglers))
+					stallNote(pterm.Info.Sprint("They will not sync on their own — run `openframe app upgrade --sync` (or sync them in ArgoCD) to roll them out."))
 				}
 			}
 
@@ -439,6 +534,7 @@ func (m *Manager) WaitForApplications(ctx context.Context, config config.ChartIn
 			// this the default experience was a static "Installing ArgoCD
 			// applications..." for up to the full 60m timeout, with no way to tell
 			// a working install from a wedged one.
+			dash.Update(currentlyReady, totalApps, apps)
 			if totalApps > 0 {
 				spinnerMutex.Lock()
 				if !spinnerStopped && spinner != nil {
@@ -502,15 +598,15 @@ func (m *Manager) WaitForApplications(ctx context.Context, config config.ChartIn
 									// out to its timeout. triggerRepoServerRecovery already
 									// hard-refreshed app.Name; cover the rest.
 									if refreshed := m.hardRefreshApplications(localCtx, appNames(unknownApps)); refreshed > 0 {
-										pterm.Info.Printfln("Hard-refreshed %d application(s) stuck in Unknown.", refreshed)
+										waitNote(pterm.Info.Sprintf("Hard-refreshed %d application(s) stuck in Unknown.", refreshed))
 									}
 								} else {
-									pterm.Warning.Println("Could not restart the ArgoCD repo-server; continuing to wait.")
+									waitNote(pterm.Warning.Sprint("Could not restart the ArgoCD repo-server; continuing to wait."))
 								}
 							} else if repoServerRecoveryAttempts == maxRepoServerRecoveryAttempts {
 								repoServerRecoveryAttempts++ // prevent repeated attempts
-								pterm.Warning.Printfln("ArgoCD repo-server did not recover after %d restarts; continuing to wait for the timeout.",
-									maxRepoServerRecoveryAttempts)
+								waitNote(pterm.Warning.Sprintf("ArgoCD repo-server did not recover after %d restarts; continuing to wait for the timeout.",
+									maxRepoServerRecoveryAttempts))
 							}
 							break // Only recover one app at a time
 						}
@@ -522,18 +618,19 @@ func (m *Manager) WaitForApplications(ctx context.Context, config config.ChartIn
 				// (throttled); the per-application dump stays behind --verbose.
 				if len(unknownApps) > 0 && elapsed > 5*time.Minute && time.Since(lastUnknownWarn) >= 5*time.Minute {
 					lastUnknownWarn = time.Now()
-					pterm.Warning.Printfln("  %d application(s) have 'Unknown' status after %s. Possible causes: controller pod not ready, git repository unreachable, or resource constraints.",
-						len(unknownApps), elapsed.Round(time.Second))
+					waitNote(pterm.Warning.Sprintf("%d application(s) have 'Unknown' status after %s. Possible causes: controller pod not ready, git repository unreachable, or resource constraints.",
+						len(unknownApps), elapsed.Round(time.Second)))
 					if config.Verbose {
 						describeUnknownApps(unknownApps)
-					} else {
+					} else if dash == nil {
 						pterm.Info.Println("  Re-run with --verbose for per-application detail.")
 					}
 				}
 
 				// A concise summary of stuck applications, every 5 minutes after the
-				// 7-minute mark (in-memory status; no kubectl resource dump).
-				if elapsed > 7*time.Minute && time.Since(lastStuckSummary) >= 5*time.Minute {
+				// 7-minute mark (in-memory status; no kubectl resource dump). The
+				// dashboard already shows exactly this, live — sequential modes only.
+				if dash == nil && elapsed > 7*time.Minute && time.Since(lastStuckSummary) >= 5*time.Minute {
 					lastStuckSummary = time.Now()
 					for _, app := range apps {
 						if app.Health != ArgoCDHealthHealthy && app.Health != ArgoCDHealthMissing {
@@ -547,45 +644,38 @@ func (m *Manager) WaitForApplications(ctx context.Context, config config.ChartIn
 				}
 			}
 
-			// Textual progress heartbeat. The spinner covers interactive users; this
-			// line is what a CI log or a piped session sees, where the spinner is
-			// suppressed entirely and the previous code printed nothing at all.
-			if totalApps > 0 && time.Since(lastProgressPrint) >= progressPrintInterval {
+			// Textual progress heartbeat — what a log, a piped session, --plain,
+			// or a --verbose run sees instead of the dashboard. Each line is
+			// self-sufficient for scrollback reading: wall clock (correlate
+			// with cluster events), the delta since the previous beat (a zero
+			// delta screams "stalled" without diffing counts by eye), and the
+			// pending apps WITH their health, not just names. Never alongside
+			// the live dashboard — a foreign print every 30s would garble the
+			// area redraw, and the dashboard already shows all of it.
+			if dash == nil && totalApps > 0 && time.Since(lastProgressPrint) >= progressPrintInterval {
 				lastProgressPrint = time.Now()
-				pterm.Info.Printf("ArgoCD sync progress: %d/%d applications ready (%s elapsed)\n",
-					currentlyReady, totalApps, elapsed.Round(time.Second))
-
-				if len(notReadyApps) > 0 {
-					if len(notReadyApps) <= 8 {
-						pterm.Info.Printf("  Still waiting for: %v\n", notReadyApps)
-					} else {
-						pterm.Info.Printf("  Still waiting for %d applications (showing first 5): %v...\n",
-							len(notReadyApps), notReadyApps[:5])
-					}
+				delta := currentlyReady - heartbeatLastReady
+				heartbeatLastReady = currentlyReady
+				pterm.Info.Printf("[%s] apps %d/%d ready (%+d since last check) · elapsed %s\n",
+					time.Now().Format("15:04:05"), currentlyReady, totalApps, delta, elapsed.Round(time.Second))
+				if p := pendingSummary(apps, 6); p != "" {
+					pterm.Info.Printf("  pending: %s\n", p)
 				}
 				if config.Verbose && len(healthyApps) > 0 && len(healthyApps) <= 5 {
 					pterm.Debug.Printf("  Recently completed: %v\n", healthyApps)
 				}
 			}
 
-			// Use the high water mark of applications that have ever been ready
-			readyCount := len(everReadyApps)
-
-			if readyCount > maxAppsSeenReady {
-				maxAppsSeenReady = readyCount
-			}
-
 			// Check if deployment is complete — ALL currently detected apps must be
 			// healthy and synced (not just "ever ready"), guarded by the high-water
-			// mark of the app count (see isDeploymentComplete).
-			allReady := isDeploymentComplete(totalApps, currentlyReady, maxAppsSeenTotal)
+			// mark of the app count AND the planned count from the app-of-apps
+			// (see isDeploymentComplete).
+			allReady := isDeploymentComplete(totalApps, currentlyReady, maxAppsSeenTotal, totalAppsExpected)
 			if !allReady && totalApps > 0 && totalApps < maxAppsSeenTotal && config.Verbose {
 				pterm.Warning.Printf("Application count dropped: %d visible vs %d previously seen — waiting for all apps to reappear\n", totalApps, maxAppsSeenTotal)
 			}
-
-			// Update ready count for display purposes (still use everReady for progress tracking)
-			if currentlyReady > maxAppsSeenReady {
-				maxAppsSeenReady = currentlyReady
+			if !allReady && config.Verbose && totalAppsExpected > 0 && totalApps < totalAppsExpected && currentlyReady == totalApps && totalApps > 0 {
+				pterm.Debug.Printf("All %d visible apps ready, but the app-of-apps plans %d — waiting for the remaining Application CRs\n", totalApps, totalAppsExpected)
 			}
 
 			// Stabilization window: require multiple consecutive all-ready checks
@@ -620,10 +710,17 @@ func (m *Manager) WaitForApplications(ctx context.Context, config config.ChartIn
 					spinnerMutex.Unlock()
 
 					if len(mm) > 0 {
+						dash.Fail("Deployed ref does not match the requested ref")
 						return refMismatchError(config.AppOfApps.GitHubBranch, mm)
 					}
 
-					pterm.Success.Println("All ArgoCD applications installed")
+					if dash != nil {
+						// The dashboard's success line carries the slowest-apps
+						// timings it collected along the way.
+						dash.FinishSuccess("All ArgoCD applications installed")
+					} else {
+						pterm.Success.Println("All ArgoCD applications installed")
+					}
 					return nil
 				}
 			} else {
@@ -644,8 +741,17 @@ func (m *Manager) waitForArgoCDReady(ctx context.Context, verbose bool, skipCRDs
 		return err
 	}
 
-	maxRetries := 100 // 100 retries * 3 seconds = 5 minutes max
-	retryInterval := 3 * time.Second
+	// Injectable budgets (see the Manager fields): zero keeps the production
+	// defaults, so real installs behave exactly as before. Tests inject tiny
+	// values to exercise the timeout paths quickly.
+	maxRetries := m.crdWaitRetries
+	if maxRetries <= 0 {
+		maxRetries = 100 // 100 retries * 3 seconds = 5 minutes max
+	}
+	retryInterval := m.podWaitInterval
+	if retryInterval <= 0 {
+		retryInterval = 3 * time.Second
+	}
 
 	// Initialize Kubernetes clients for native API access
 	if err := m.initKubernetesClients(); err != nil {
@@ -702,7 +808,13 @@ func (m *Manager) waitForArgoCDReady(ctx context.Context, verbose bool, skipCRDs
 				pterm.Info.Println("Waiting for ArgoCD CRD applications.argoproj.io...")
 			}
 
-			time.Sleep(retryInterval)
+			// Ctx-aware: a plain Sleep would hold Ctrl+C hostage for the whole
+			// interval (same fix as the main loop's backoff sleeps).
+			select {
+			case <-ctx.Done():
+				return fmt.Errorf("operation cancelled: %w", ctx.Err())
+			case <-time.After(retryInterval):
+			}
 		}
 	}
 
@@ -711,10 +823,17 @@ func (m *Manager) waitForArgoCDReady(ctx context.Context, verbose bool, skipCRDs
 		pterm.Info.Println("Waiting for ArgoCD pods to be ready...")
 	}
 
-	podExistenceTimeout := 120 * time.Second
-	podExistenceInterval := 3 * time.Second
+	podExistenceTimeout := m.podWaitTimeout
+	if podExistenceTimeout <= 0 {
+		podExistenceTimeout = 120 * time.Second
+	}
+	podExistenceInterval := retryInterval
 	podExistenceStart := time.Now()
 	podsExist := false
+	// Time-based throttle, not `elapsed%15 == 0`: the loop advances by 3s plus
+	// API latency, so exact multiples of 15 land by luck (see the main loop's
+	// periodic-output throttles for the same fix).
+	lastPodWaitNote := time.Time{}
 
 	for time.Since(podExistenceStart) < podExistenceTimeout {
 		select {
@@ -736,11 +855,16 @@ func (m *Manager) waitForArgoCDReady(ctx context.Context, verbose bool, skipCRDs
 			break
 		}
 
-		if verbose && int(time.Since(podExistenceStart).Seconds())%15 == 0 {
+		if verbose && time.Since(lastPodWaitNote) >= 15*time.Second {
+			lastPodWaitNote = time.Now()
 			pterm.Info.Println("Waiting for ArgoCD pods to be created...")
 		}
 
-		time.Sleep(podExistenceInterval)
+		select {
+		case <-ctx.Done():
+			return fmt.Errorf("operation cancelled: %w", ctx.Err())
+		case <-time.After(podExistenceInterval):
+		}
 	}
 
 	if !podsExist {
@@ -750,7 +874,10 @@ func (m *Manager) waitForArgoCDReady(ctx context.Context, verbose bool, skipCRDs
 	}
 
 	// Wait for all pods to be Ready using native client
-	podReadyTimeout := 5 * time.Minute
+	podReadyTimeout := m.podReadyTimeout
+	if podReadyTimeout <= 0 {
+		podReadyTimeout = 5 * time.Minute
+	}
 	podReadyStart := time.Now()
 
 	for time.Since(podReadyStart) < podReadyTimeout {
@@ -768,7 +895,11 @@ func (m *Manager) waitForArgoCDReady(ctx context.Context, verbose bool, skipCRDs
 			if verbose {
 				pterm.Warning.Printf("Failed to list pods: %v\n", err)
 			}
-			time.Sleep(retryInterval)
+			select {
+			case <-ctx.Done():
+				return fmt.Errorf("operation cancelled: %w", ctx.Err())
+			case <-time.After(retryInterval):
+			}
 			continue
 		}
 
@@ -787,7 +918,11 @@ func (m *Manager) waitForArgoCDReady(ctx context.Context, verbose bool, skipCRDs
 			return nil
 		}
 
-		time.Sleep(retryInterval)
+		select {
+		case <-ctx.Done():
+			return fmt.Errorf("operation cancelled: %w", ctx.Err())
+		case <-time.After(retryInterval):
+		}
 	}
 
 	m.printArgoCDPodDiagnostics(ctx)
@@ -846,6 +981,27 @@ func describeUnknownApps(unknownApps []Application) {
 // next-step hint that follows it.
 const maxAppsInTimeoutError = 10
 
+// maxAppsDiagnosedAtTimeout bounds the deep workload diagnosis at timeout: each
+// diagnosed app costs a pod list, a log stream per failing container, and an
+// events list, and the whole gather must fit the margin capToDeadline reserved.
+const maxAppsDiagnosedAtTimeout = 5
+
+// notReadyApplications returns up to limit applications that are not
+// Healthy+Synced, for the timeout workload diagnosis.
+func notReadyApplications(apps []Application, limit int) []Application {
+	var out []Application
+	for _, app := range apps {
+		if app.Health == ArgoCDHealthHealthy && app.Sync == ArgoCDSyncSynced {
+			continue
+		}
+		out = append(out, app)
+		if len(out) >= limit {
+			break
+		}
+	}
+	return out
+}
+
 // timeoutError builds the error returned when the wait budget is exhausted.
 //
 // The old message was "timeout waiting for ArgoCD applications after 1h0m0s" —
@@ -858,7 +1014,7 @@ const maxAppsInTimeoutError = 10
 // must be kept separate: feeding a decorated label into `kubectl describe
 // application` produced `kubectl describe application argocd-apps (Health:
 // Progressing) -n argocd`, which is not a runnable command.
-func timeoutError(timeout time.Duration, ready, total int, notReadyLabels, notReadyNames []string) error {
+func timeoutError(timeout time.Duration, ready, total int, notReadyLabels, notReadyNames, notReadyDetails []string, workloadDiag string) error {
 	var b strings.Builder
 	fmt.Fprintf(&b, "timeout after %s waiting for ArgoCD applications", timeout)
 	if total > 0 {
@@ -875,9 +1031,118 @@ func timeoutError(timeout time.Duration, ready, total int, notReadyLabels, notRe
 		fmt.Fprintf(&b, "; still not ready: %s%s", strings.Join(shown, ", "), suffix)
 	}
 
+	// Per-app health messages and unhealthy child resources say WHY (e.g. the
+	// exact Deployment that missed its progress deadline inside a Degraded app),
+	// so the timeout is actionable rather than opaque.
+	if len(notReadyDetails) > 0 {
+		b.WriteString("\nWhy they are not ready:")
+		for _, d := range notReadyDetails {
+			b.WriteString("\n" + d)
+		}
+	}
+
+	// The pod-level view: failing containers with reasons, their last crash-log
+	// lines, and recent warning events — gathered at the moment of timeout.
+	if d := strings.TrimSpace(workloadDiag); d != "" {
+		b.WriteString("\nFailing workloads (pod errors, last logs, warning events):")
+		b.WriteString("\n" + indentLines(d, "  "))
+	}
+
 	b.WriteString("\nInspect them with: kubectl get applications -n argocd")
 	if len(notReadyNames) > 0 {
 		fmt.Fprintf(&b, "\nDetails for one: kubectl describe application %s -n argocd", notReadyNames[0])
 	}
+	if len(notReadyDetails) > 0 || strings.TrimSpace(workloadDiag) != "" {
+		// The per-app health messages above ARE the diagnosis; suppress the
+		// generic handler's pattern-matched hint (it misfires on their content).
+		return selfDiagnosedError(b.String())
+	}
 	return fmt.Errorf("%s", b.String())
+}
+
+// capToDeadline shrinks a wait budget so it elapses BEFORE the context
+// deadline, leaving a margin to gather and render the timeout diagnostic.
+// Returns the configured budget unchanged when the context has no deadline or
+// the deadline is farther away. A (nearly) exhausted deadline yields 0 — the
+// wait times out on its first tick rather than riding into ctx.Err().
+func capToDeadline(ctx context.Context, configured time.Duration, from time.Time) time.Duration {
+	const margin = time.Minute
+	dl, ok := ctx.Deadline()
+	if !ok {
+		return configured
+	}
+	remaining := dl.Sub(from) - margin
+	if remaining < 0 {
+		return 0
+	}
+	if remaining < configured {
+		return remaining
+	}
+	return configured
+}
+
+// defaultAppWaitTimeout is the install/bootstrap application-wait budget: 60m,
+// overridable via OPENFRAME_APP_WAIT_TIMEOUT (a Go duration, e.g. "35m"). A CI
+// job with a shorter step cap sets it so the CLI hits its OWN timeout — and
+// prints its diagnostic — before the job is killed opaquely. The upgrade path
+// is unaffected: it sets an explicit WithWaitTimeout (>0), so this default
+// branch never runs there.
+func defaultAppWaitTimeout() time.Duration {
+	const fallback = 60 * time.Minute
+	if v := strings.TrimSpace(os.Getenv("OPENFRAME_APP_WAIT_TIMEOUT")); v != "" {
+		if d, err := time.ParseDuration(v); err == nil && d > 0 {
+			return d
+		}
+	}
+	return fallback
+}
+
+// maxResourcesPerAppInDiagnostics bounds the unhealthy-children list per app:
+// one wedged node can degrade dozens of resources at once, and the point is to
+// name the failing pieces, not to inventory the cluster.
+const maxResourcesPerAppInDiagnostics = 8
+
+// notReadyDiagnostics returns one diagnostic block per not-ready application:
+// ArgoCD's app-level health message, plus the unhealthy CHILD resources with
+// their per-resource health messages — which is what names the exact
+// Deployment/StatefulSet/child-Application that is failing inside a Degraded
+// app (the app-level message is frequently empty). Trimmed to stay readable.
+func notReadyDiagnostics(apps []Application) []string {
+	const maxMsg = 300
+	var out []string
+	for _, app := range apps {
+		if app.Health == ArgoCDHealthHealthy && app.Sync == ArgoCDSyncSynced {
+			continue
+		}
+		line := fmt.Sprintf("  - %s: health=%s sync=%s", app.Name, app.Health, app.Sync)
+		if msg := strings.TrimSpace(app.HealthMessage); msg != "" {
+			if len(msg) > maxMsg {
+				msg = msg[:maxMsg] + "…"
+			}
+			line += "\n      " + strings.ReplaceAll(msg, "\n", "\n      ")
+		}
+		shown := app.UnhealthyResources
+		suffix := ""
+		if len(shown) > maxResourcesPerAppInDiagnostics {
+			suffix = fmt.Sprintf("\n      … and %d more unhealthy resource(s)", len(shown)-maxResourcesPerAppInDiagnostics)
+			shown = shown[:maxResourcesPerAppInDiagnostics]
+		}
+		for _, res := range shown {
+			resLine := fmt.Sprintf("\n      %s %s", res.Kind, res.Name)
+			if res.Namespace != "" {
+				resLine = fmt.Sprintf("\n      %s %s/%s", res.Kind, res.Namespace, res.Name)
+			}
+			resLine += ": " + res.Health
+			if msg := strings.TrimSpace(res.Message); msg != "" {
+				if len(msg) > maxMsg {
+					msg = msg[:maxMsg] + "…"
+				}
+				resLine += " — " + strings.ReplaceAll(msg, "\n", " ")
+			}
+			line += resLine
+		}
+		line += suffix
+		out = append(out, line)
+	}
+	return out
 }

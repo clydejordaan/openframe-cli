@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"os"
 	"os/signal"
+	"runtime/debug"
 	"syscall"
 
 	"github.com/flamingo-stack/openframe-cli/cmd/app"
@@ -40,10 +41,54 @@ var (
 
 // DefaultVersionInfo provides default version information, populated from the
 // build-time vars above (overridden via -ldflags -X at release time).
-var DefaultVersionInfo = VersionInfo{
-	Version: version,
-	Commit:  commit,
-	Date:    date,
+var DefaultVersionInfo = resolveVersionInfo(version, commit, date)
+
+// resolveVersionInfo returns the build-time version metadata. On a dev build —
+// where the release-time -ldflags were not applied, so commit is "none" and
+// date "unknown" — it backfills them from the VCS stamp Go embeds in every
+// `go build`/`go install`/`make build` binary, so the build is identifiable
+// ("dev (85c7c15f11b9) built on <time>") instead of "dev (none) built on
+// unknown". The version string stays "dev", which is what keeps self-update
+// disabled for non-release builds.
+func resolveVersionInfo(version, commit, date string) VersionInfo {
+	info := VersionInfo{Version: version, Commit: commit, Date: date}
+	if commit != "none" && date != "unknown" {
+		return info // release build — ldflags were applied
+	}
+	if bi, ok := debug.ReadBuildInfo(); ok {
+		info = backfillFromVCS(info, bi.Settings)
+	}
+	return info
+}
+
+// backfillFromVCS fills commit/date from Go's embedded VCS settings, but only
+// where they are still at their dev defaults.
+func backfillFromVCS(info VersionInfo, settings []debug.BuildSetting) VersionInfo {
+	var rev, vcsTime string
+	var modified bool
+	for _, s := range settings {
+		switch s.Key {
+		case "vcs.revision":
+			rev = s.Value
+		case "vcs.time":
+			vcsTime = s.Value
+		case "vcs.modified":
+			modified = s.Value == "true"
+		}
+	}
+	if info.Commit == "none" && rev != "" {
+		if len(rev) > 12 {
+			rev = rev[:12]
+		}
+		if modified {
+			rev += "-dirty"
+		}
+		info.Commit = rev
+	}
+	if info.Date == "unknown" && vcsTime != "" {
+		info.Date = vcsTime
+	}
+	return info
 }
 
 // GetRootCmd returns the root command following cluster command pattern
@@ -64,7 +109,7 @@ for CLI design with wizard-style interactive prompts.
 
 Key Features:
   - Interactive Wizard - Step-by-step guided setup
-  - Cluster Management - K3d, Kind, and cloud provider support
+  - Cluster Management - local K3d and cloud GKE / AWS EKS clusters
   - Helm Integration - App-of-Apps pattern with ArgoCD
   - Prerequisite Checking - Validates tools before running
 
@@ -77,18 +122,13 @@ operation for automation and power users.`,
 		// Apply --silent before any command runs so it honors its contract
 		// ("suppress all output except errors") across every subcommand.
 		PersistentPreRunE: func(cmd *cobra.Command, args []string) error {
-			silent, _ := cmd.Flags().GetBool("silent")
-			if silent {
-				ui.SetSilent()
-			}
-			// --verbose enables pterm's Debug printer. Without this the ~35
+			// --verbose enables pterm's Debug printer. Without this the ~40
 			// pterm.Debug call sites across the codebase (executed helm/k3d
 			// command lines, ArgoCD wait internals, prerequisite decisions)
-			// print NOTHING, ever — the diagnostics were written but never
-			// reachable. --silent wins when both are given.
-			if v, _ := cmd.Flags().GetBool("verbose"); v && !silent {
-				pterm.EnableDebugMessages()
-			}
+			// print NOTHING, ever. NOTE: cobra runs only the CLOSEST parent's
+			// PersistentPreRunE — command groups with their own hook (app,
+			// cluster) shadow this one and must call the same helper.
+			ui.ApplyGlobalOutputFlags(cmd)
 			return nil
 		},
 		RunE: func(cmd *cobra.Command, args []string) error {
@@ -108,6 +148,7 @@ operation for automation and power users.`,
 	// Add global flags following cluster pattern
 	rootCmd.PersistentFlags().BoolP("verbose", "v", false, "Enable verbose output")
 	rootCmd.PersistentFlags().Bool("silent", false, "Suppress all output except errors")
+	rootCmd.PersistentFlags().Bool("plain", false, "Sequential output without spinners or in-place redraws (for scripts, tmux logging, watch)")
 
 	// Version template
 	rootCmd.SetVersionTemplate(`{{printf "%s\n" .Version}}`)
@@ -180,6 +221,13 @@ func ExecuteWithVersion(versionInfo VersionInfo) error {
 	defer stop()
 
 	err := rootCmd.ExecuteContext(ctx)
+
+	// Restore default signal handling before the post-command window: the
+	// NotifyContext handler keeps capturing SIGINT after the context has been
+	// consumed, so during an opted-in auto-update (up to 10 minutes) Ctrl-C was
+	// swallowed with no way to interrupt. After stop(), Ctrl-C terminates the
+	// process again.
+	stop()
 
 	// Post-command self-update handling, best-effort and printed to stderr so it
 	// never blocks the command, changes its exit code, or corrupts machine output
