@@ -1,12 +1,13 @@
 package ui
 
 import (
+	stderrors "errors"
 	"fmt"
 	"os"
 	"strconv"
 	"strings"
 
-	"github.com/manifoldco/promptui"
+	"github.com/charmbracelet/huh"
 	"github.com/pterm/pterm"
 	"golang.org/x/term"
 )
@@ -24,6 +25,26 @@ func IsNonInteractive() bool {
 	}
 	return !term.IsTerminal(int(os.Stdin.Fd()))
 }
+
+// ErrPromptInterrupted is returned when the user aborts an interactive prompt
+// with Ctrl+C (huh's quit binding; Esc only manages the list filter). Its text
+// is exactly "interrupted": the shared error handler matches it structurally
+// via errors.Is and by that string (see errors.isInterruption) and prints a
+// friendly "cancelled" notice instead of a failure panel.
+var ErrPromptInterrupted = stderrors.New("interrupted")
+
+// normalizePromptError maps huh's abort sentinel onto ErrPromptInterrupted so
+// every prompt in the CLI reports user cancellation the same way.
+func normalizePromptError(err error) error {
+	if stderrors.Is(err, huh.ErrUserAborted) {
+		return ErrPromptInterrupted
+	}
+	return err
+}
+
+// selectPageSize caps how many rows a long select shows at once; longer lists
+// scroll (and are two filter keystrokes away from any entry).
+const selectPageSize = 10
 
 // confirm shows pterm's styled interactive y/N confirmation with the given
 // default. It is the single implementation behind the exported confirm helpers.
@@ -57,30 +78,81 @@ func ConfirmDeletion(resourceType, resourceName string) (bool, error) {
 	return confirm(fmt.Sprintf("Are you sure you want to delete %s '%s'?", resourceType, pterm.Cyan(resourceName)), false)
 }
 
-// selectTemplates is the shared styling for the interactive list selectors.
-var selectTemplates = &promptui.SelectTemplates{
-	Label:    "{{ . }}?",
-	Active:   "→ {{ . | cyan }}",
-	Inactive: "  {{ . | white }}",
-	Selected: "✓ {{ . | green }}",
+// SelectFromList prompts the user to select from a list of options. Pressing
+// "/" filters the list (fuzzy, case-insensitive), so a 30-cluster list is a
+// few keystrokes away from the right entry; arrow keys navigate as before.
+// The label is rendered with a trailing "?", matching the CLI's historical
+// picker wording.
+func SelectFromList(label string, items []string) (int, string, error) {
+	return runSelect(label+"?", items)
 }
 
-// SelectFromList prompts the user to select from a list of options. Typing
-// filters the list (case-insensitive substring over the whole row), so a
-// 30-cluster list is two keystrokes away from the right entry; arrow keys
-// still navigate as before.
-func SelectFromList(label string, items []string) (int, string, error) {
-	prompt := promptui.Select{
-		Label:     label,
-		Items:     items,
-		Templates: selectTemplates,
-		Size:      10,
-		Searcher: func(input string, index int) bool {
-			return strings.Contains(strings.ToLower(items[index]), strings.ToLower(input))
-		},
-		StartInSearchMode: true,
+// SelectOption prompts the user to pick from a short fixed list (wizard steps,
+// yes/no style choices). Same interaction as SelectFromList; the separate name
+// keeps call sites explicit about intent.
+func SelectOption(label string, items []string) (int, string, error) {
+	return runSelect(label, items)
+}
+
+// requireInteractive fails fast when no one can answer a prompt (CI, piped
+// stdin). Unix CI already fails fast — bubbletea cannot open /dev/tty there —
+// but Windows runners DO have a console, where a prompt blocks reading it until
+// the job times out (a wizard test hung a Windows runner for its full 10
+// minutes exactly this way). Same contract as RequireConfirmation.
+func requireInteractive(label string) error {
+	if IsNonInteractive() {
+		return fmt.Errorf("prompt %q requires an interactive terminal", label)
 	}
-	return prompt.Run()
+	return nil
+}
+
+func runSelect(label string, items []string) (int, string, error) {
+	if err := requireInteractive(label); err != nil {
+		return 0, "", err
+	}
+	options := make([]huh.Option[int], len(items))
+	for i, item := range items {
+		options[i] = huh.NewOption(item, i)
+	}
+	var idx int
+	sel := huh.NewSelect[int]().
+		Title(label).
+		Options(options...).
+		Value(&idx)
+	if len(items) > selectPageSize {
+		// Long lists scroll; tell the user the filter exists. huh's Height
+		// includes the title and description rows (viewport = height - chrome),
+		// so +2 shows exactly selectPageSize option rows; while filtering the
+		// title row becomes the filter input — still one row, so this holds.
+		sel = sel.
+			Description("type / to filter").
+			Height(selectPageSize + 2)
+	}
+	if err := sel.Run(); err != nil {
+		return 0, "", normalizePromptError(err)
+	}
+	return idx, items[idx], nil
+}
+
+// PromptInput shows a single-line text prompt. defaultVal pre-fills the field
+// (editable in place, so Enter accepts it as-is); validate, when non-nil, runs
+// on each submission attempt and blocks until it passes. The result is
+// whitespace-trimmed.
+func PromptInput(label, defaultVal string, validate func(string) error) (string, error) {
+	if err := requireInteractive(label); err != nil {
+		return "", err
+	}
+	value := defaultVal
+	in := huh.NewInput().
+		Title(label).
+		Value(&value)
+	if validate != nil {
+		in = in.Validate(validate)
+	}
+	if err := in.Run(); err != nil {
+		return "", normalizePromptError(err)
+	}
+	return strings.TrimSpace(value), nil
 }
 
 // ValidateNonEmpty validates that input is not empty after trimming
