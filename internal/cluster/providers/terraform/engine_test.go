@@ -7,6 +7,7 @@ import (
 	"io"
 	"os"
 	"path/filepath"
+	"runtime"
 	"testing"
 
 	"github.com/hashicorp/terraform-exec/tfexec"
@@ -228,4 +229,33 @@ func TestEngine_PlanCarriesPlanJSON(t *testing.T) {
 	require.NoError(t, err)
 	// The machine-readable plan feeds the optional infracost estimate.
 	assert.Contains(t, string(summary.PlanJSON), "google_container_cluster.primary")
+}
+
+// Verbose must wrap the production runner so human output (init, plan)
+// streams while machine-readable commands stay off the terminal — a global
+// SetStdout(os.Stdout) used to tee the entire `terraform show -json` plan
+// (one 641 KB line) into a verbose session. The stub binary is never
+// executed; the test only exercises runner construction.
+func TestNewEngine_VerboseWrapsRunnerForSelectiveStdout(t *testing.T) {
+	home := t.TempDir()
+	t.Setenv("HOME", home)
+	binDir := filepath.Join(home, "bin")
+	require.NoError(t, os.MkdirAll(binDir, 0o750))
+	require.NoError(t, os.WriteFile(filepath.Join(binDir, "terraform"), []byte("#!/bin/sh\n"), 0o750)) // #nosec G306 -- must be executable for LookPath
+	if runtime.GOOS == "windows" {
+		// Windows LookPath resolves only PATHEXT extensions, so the bare
+		// "terraform" fixture is invisible there — provide terraform.exe too.
+		require.NoError(t, os.WriteFile(filepath.Join(binDir, "terraform.exe"), []byte("stub"), 0o750)) // #nosec G306
+	}
+	t.Setenv("PATH", binDir)
+
+	verbose, err := NewEngine(true).newRunner(t.TempDir())
+	require.NoError(t, err)
+	assert.IsType(t, &verboseRunner{}, verbose,
+		"verbose must stream selectively via verboseRunner, not hold stdout for every command")
+
+	quiet, err := NewEngine(false).newRunner(t.TempDir())
+	require.NoError(t, err)
+	assert.IsType(t, &tfexec.Terraform{}, quiet,
+		"non-verbose needs no wrapper — stdout is never streamed")
 }

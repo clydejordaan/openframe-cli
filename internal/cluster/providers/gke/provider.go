@@ -292,6 +292,11 @@ func (p *Provider) CreateCluster(ctx context.Context, config models.ClusterConfi
 	if err := tfengine.WriteModule(ws.TerraformDir(), mainTF, vars); err != nil {
 		return nil, err
 	}
+	if !freshWorkspace {
+		// A resumed create is creating again — `cluster list` must not keep
+		// reporting the previous attempt's "Failed" while an apply is running.
+		_ = ws.SetStatus(tfengine.StatusCreating)
+	}
 
 	if err := p.engine.Init(ctx, ws.TerraformDir()); err != nil {
 		_ = ws.SetStatus(tfengine.StatusFailed)
@@ -358,6 +363,9 @@ func (p *Provider) CreateCluster(ctx context.Context, config models.ClusterConfi
 		return nil, models.NewClusterOperationError("create", config.Name, err)
 	}
 	record.Status = tfengine.StatusReady
+	// CREATED means "when this cluster became Ready": a resumed create must
+	// not keep the first, failed attempt's timestamp forever.
+	record.CreatedAt = time.Now().UTC()
 	if err := ws.WriteRecord(record); err != nil {
 		return nil, err
 	}
@@ -480,13 +488,39 @@ func (p *Provider) GetKubeconfig(ctx context.Context, name string, clusterType m
 	return string(data), nil
 }
 
+// kubeContextFor resolves the kubeconfig context that reaches this cluster,
+// or "" when none exists — never a value fabricated from the cluster name (a
+// plan-stage failure has no context at all). Beyond the plain name our merge
+// writes, it recognizes the gke_<project>_<location>_<name> context `gcloud
+// container clusters get-credentials` creates — the same candidate shape
+// discovery's matchContext uses. The record stores only the region, so the
+// location segment must be the region itself (regional cluster) or a zone
+// inside it ("us-central1-a") — without that check, a same-name same-project
+// cluster in ANOTHER region could satisfy the prefix/suffix alone and the
+// lexically first context would win.
+func kubeContextFor(rec tfengine.Record) string {
+	if tfengine.KubeconfigHasContext(rec.Name) {
+		return rec.Name
+	}
+	prefix := "gke_" + rec.Project + "_"
+	suffix := "_" + rec.Name
+	return tfengine.KubeconfigContextMatching(func(name string) bool {
+		if !strings.HasPrefix(name, prefix) || !strings.HasSuffix(name, suffix) {
+			return false
+		}
+		location := strings.TrimSuffix(strings.TrimPrefix(name, prefix), suffix)
+		return location == rec.Region || strings.HasPrefix(location, rec.Region+"-")
+	})
+}
+
 // infoFor maps a registry record onto the shared ClusterInfo shape.
 func infoFor(rec tfengine.Record) models.ClusterInfo {
+	kubeContext := kubeContextFor(rec)
 	return models.ClusterInfo{
 		Name:       rec.Name,
 		Type:       models.ClusterTypeGKE,
 		Source:     models.SourceOpenframe,
-		Context:    rec.Name,
+		Context:    kubeContext,
 		Project:    rec.Project,
 		Region:     rec.Region,
 		Status:     rec.Status.Title(),
