@@ -196,10 +196,12 @@ func (ui *OperationsUI) SelectClusterForCleanup(clusters []models.ClusterInfo, a
 }
 
 // confirmCleanup asks for user confirmation before cleaning up a cluster.
+// The prompt says exactly what cleanup does — prune unused images — so nobody
+// confirms it expecting (or fearing) a platform teardown.
 // Non-interactive sessions fail fast with a --force hint instead of blocking.
 func (ui *OperationsUI) confirmCleanup(clusterName string) (bool, error) {
 	return sharedUI.RequireConfirmation(
-		fmt.Sprintf("Are you sure you want to cleanup cluster '%s'?", pterm.Cyan(clusterName)),
+		fmt.Sprintf("Prune unused container images on cluster '%s'? Installed apps are not touched.", pterm.Cyan(clusterName)),
 		"--force", false)
 }
 
@@ -242,23 +244,9 @@ func (ui *OperationsUI) ShowCleanupSummary(clusterName string, result models.Cle
 	// to stdout and survive --silent, whose contract is "errors only".
 	pterm.DefaultBasicText.Println()
 	if result.Removed() == 0 {
-		pterm.Info.Println("Nothing to remove: the cluster had no OpenFrame resources left.")
+		pterm.Info.Println("Nothing to prune: no cluster nodes had unused images.")
 	} else {
-		pterm.Info.Printf("Removed:\n")
-		for _, line := range []struct {
-			n     int
-			label string
-		}{
-			{result.ApplicationsDeleted, "ArgoCD application(s)"},
-			{result.FinalizersCleared, "stuck application finalizer(s) cleared"},
-			{result.ReleasesRemoved, "Helm release(s)"},
-			{result.NamespacesDeleted, "namespace(s)"},
-			{result.NodesPruned, "node(s) pruned of unused container images"},
-		} {
-			if line.n > 0 {
-				pterm.DefaultBasicText.Printf("  %d %s\n", line.n, line.label)
-			}
-		}
+		pterm.Info.Printf("Pruned unused container images on %d node(s)\n", result.NodesPruned)
 	}
 
 	if result.Partial() {
@@ -267,7 +255,9 @@ func (ui *OperationsUI) ShowCleanupSummary(clusterName string, result models.Cle
 		for _, f := range result.Failures {
 			pterm.DefaultBasicText.Printf("  • %s\n", f)
 		}
-		pterm.Info.Printf("Re-run with --force, or delete the cluster: openframe cluster delete %s\n", clusterName)
+		// A plain re-run hint: --force only skips the confirmation prompt, so
+		// suggesting it here would imply a more aggressive retry that doesn't exist.
+		pterm.Info.Printf("Re-run the cleanup, or delete the cluster: openframe cluster delete %s\n", clusterName)
 	}
 }
 
@@ -279,6 +269,17 @@ func (ui *OperationsUI) ShowOperationSuccess(operation, clusterName string, clus
 	case "delete":
 		pterm.Success.Printf("Cluster '%s' deleted successfully\n", pterm.Cyan(clusterName))
 
+		// The RESOURCES row must only claim what this path verified. A k3d
+		// delete removes everything the cluster owned. A cloud delete destroys
+		// the terraform-managed resources — PVC-provisioned disks live outside
+		// the state, and the provider's orphan sweep has already reported (or
+		// deleted) any survivors right above this box; "Cleaned up" printed
+		// under that warning would contradict it.
+		resources := pterm.Gray("Cleaned up")
+		if clusterType != models.ClusterTypeK3d {
+			resources = pterm.Gray("Terraform-managed destroyed (leftovers, if any, reported above)")
+		}
+
 		// Show detailed deletion box
 		pterm.DefaultBasicText.Println()
 		boxContent := fmt.Sprintf(
@@ -289,7 +290,7 @@ func (ui *OperationsUI) ShowOperationSuccess(operation, clusterName string, clus
 			pterm.Bold.Sprint(clusterName),
 			strings.ToUpper(string(clusterType)),
 			pterm.Red("Deleted"),
-			pterm.Gray("Cleaned up"),
+			resources,
 		)
 
 		pterm.DefaultBox.
@@ -336,7 +337,7 @@ func (ui *OperationsUI) ShowConfigurationSummary(config models.ClusterConfig, dr
 	// "silent" output (verification report saw the leak and graded it silent).
 	pterm.DefaultBasicText.Printf("   Name: %s\n", pterm.Cyan(config.Name))
 	pterm.DefaultBasicText.Printf("   Type: %s\n", string(config.Type))
-	pterm.DefaultBasicText.Printf("  Nodes: %d\n", config.NodeCount)
+	pterm.DefaultBasicText.Printf("  Nodes: %s\n", NodesLine(config))
 
 	if config.K8sVersion != "" {
 		pterm.DefaultBasicText.Printf("Version: %s\n", config.K8sVersion)
@@ -349,7 +350,13 @@ func (ui *OperationsUI) ShowConfigurationSummary(config models.ClusterConfig, dr
 		if config.Cloud.MachineType != "" {
 			pterm.DefaultBasicText.Printf("Instance: %s\n", config.Cloud.MachineType)
 		}
+		if config.Cloud.Spot {
+			pterm.DefaultBasicText.Printf("   Spot: yes (spot-capacity nodes)\n")
+		}
 		pterm.Warning.Println(CostHint(config.Type))
+		if hint := SpotHint(config); hint != "" {
+			pterm.Info.Println(hint)
+		}
 	}
 
 	pterm.DefaultBasicText.Println()

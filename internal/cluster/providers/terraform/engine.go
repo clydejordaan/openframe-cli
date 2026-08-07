@@ -8,6 +8,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"time"
 
 	"github.com/flamingo-stack/openframe-cli/internal/shared/download"
 	"github.com/hashicorp/terraform-exec/tfexec"
@@ -133,6 +134,58 @@ func (e *Engine) Init(ctx context.Context, dir string) error {
 	return nil
 }
 
+// OpLogName is the per-workspace record of terraform apply/destroy runs. Long
+// cloud operations used to leave the terminal as their only record; every
+// run now appends its raw terraform JSON-UI stream here, so a failure hours
+// later is still diagnosable.
+const OpLogName = "terraform.log"
+
+// bestEffortTee mirrors every chunk into the log sink while it works and
+// drops the sink on its first write failure. It exists because io.MultiWriter
+// propagates a sink error: exec.Cmd returns a stdout-writer error from Wait,
+// so a disk filling up mid-apply would report the terraform run as FAILED
+// while terraform actually completed and changed resources. The log is a
+// record of the operation — it must never decide its outcome.
+type bestEffortTee struct {
+	progress io.Writer
+	sink     io.Writer // nil once a write failed; never re-enabled
+}
+
+func (t *bestEffortTee) Write(p []byte) (int, error) {
+	if t.sink != nil {
+		if _, err := t.sink.Write(p); err != nil {
+			t.sink = nil
+		}
+	}
+	return t.progress.Write(p)
+}
+
+// opSinks builds the writer an apply/destroy streams into: the progress
+// writer, teed into dir's terraform.log when it can be opened. Logging is
+// best-effort end to end — a directory that cannot take the log (read-only,
+// gone) skips it, and a write failure after opening only stops the mirroring
+// (bestEffortTee above); neither may ever fail the operation itself.
+// The returned close is always safe to call; logPath is empty when no log is
+// being written.
+func (e *Engine) opSinks(dir, op string) (w io.Writer, close func(), logPath string) {
+	progress := newProgressWriter(e.verbose)
+	f, err := os.OpenFile(filepath.Join(dir, OpLogName), os.O_CREATE|os.O_APPEND|os.O_WRONLY, 0o600) // #nosec G304 -- dir is a CLI-managed workspace directory (same trust as the terraform state written next to it), joined with a constant filename
+	if err != nil {
+		return progress, func() {}, ""
+	}
+	fmt.Fprintf(f, "=== terraform %s — %s ===\n", op, time.Now().UTC().Format(time.RFC3339))
+	return &bestEffortTee{progress: progress, sink: f}, func() { _ = f.Close() }, f.Name()
+}
+
+// opFailure wraps a failed apply/destroy, pointing at the full log when one
+// was written — the terminal scrollback must not be the only record.
+func opFailure(op string, logPath string, err error) error {
+	if logPath != "" {
+		return fmt.Errorf("terraform %s failed (full log: %s): %w", op, logPath, err)
+	}
+	return fmt.Errorf("terraform %s failed: %w", op, err)
+}
+
 // Apply runs terraform apply in dir, streaming per-resource progress lines
 // (via terraform's machine-readable -json output) so a 15-minute cloud apply
 // is never a silent wait. It is idempotent: re-running after a partial
@@ -142,8 +195,10 @@ func (e *Engine) Apply(ctx context.Context, dir string) error {
 	if err != nil {
 		return err
 	}
-	if err := tf.ApplyJSON(ctx, newProgressWriter(e.verbose)); err != nil {
-		return fmt.Errorf("terraform apply failed: %w", err)
+	w, closeLog, logPath := e.opSinks(dir, "apply")
+	defer closeLog()
+	if err := tf.ApplyJSON(ctx, w); err != nil {
+		return opFailure("apply", logPath, err)
 	}
 	return nil
 }
@@ -163,8 +218,10 @@ func (e *Engine) Destroy(ctx context.Context, dir string) error {
 	if err != nil {
 		return err
 	}
-	if err := tf.DestroyJSON(ctx, newProgressWriter(e.verbose)); err != nil {
-		return fmt.Errorf("terraform destroy failed: %w", err)
+	w, closeLog, logPath := e.opSinks(dir, "destroy")
+	defer closeLog()
+	if err := tf.DestroyJSON(ctx, w); err != nil {
+		return opFailure("destroy", logPath, err)
 	}
 	return nil
 }
@@ -273,8 +330,10 @@ func (e *Engine) ApplyPlan(ctx context.Context, dir, planFile string) error {
 	if err != nil {
 		return err
 	}
-	if err := tf.ApplyJSON(ctx, newProgressWriter(e.verbose), tfexec.DirOrPlan(planFile)); err != nil {
-		return fmt.Errorf("terraform apply failed: %w", err)
+	w, closeLog, logPath := e.opSinks(dir, "apply")
+	defer closeLog()
+	if err := tf.ApplyJSON(ctx, w, tfexec.DirOrPlan(planFile)); err != nil {
+		return opFailure("apply", logPath, err)
 	}
 	return nil
 }

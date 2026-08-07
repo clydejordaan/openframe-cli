@@ -5,7 +5,9 @@ import (
 	"fmt"
 	"os"
 	"os/signal"
+	"runtime"
 	"runtime/debug"
+	"strings"
 	"syscall"
 
 	"github.com/flamingo-stack/openframe-cli/cmd/app"
@@ -13,6 +15,7 @@ import (
 	"github.com/flamingo-stack/openframe-cli/cmd/cluster"
 	"github.com/flamingo-stack/openframe-cli/cmd/prerequisites"
 	"github.com/flamingo-stack/openframe-cli/cmd/update"
+	"github.com/flamingo-stack/openframe-cli/internal/chart/providers/argocd"
 	"github.com/flamingo-stack/openframe-cli/internal/shared/config"
 	"github.com/flamingo-stack/openframe-cli/internal/shared/download"
 	"github.com/flamingo-stack/openframe-cli/internal/shared/selfupdate"
@@ -96,26 +99,66 @@ func GetRootCmd(versionInfo VersionInfo) *cobra.Command {
 	return buildRootCommand(versionInfo)
 }
 
+// pinnedDependencies renders the versions this build installs (verified,
+// checksum-pinned downloads) and deploys — so `--version` answers not just
+// "which CLI" but "which terraform/helm/argocd comes with it". Sources: the
+// PinnedTool definitions in internal/shared/download and the ArgoCD chart pin
+// in internal/chart/providers/argocd.
+func pinnedDependencies() string {
+	var b strings.Builder
+	b.WriteString("Pinned dependencies (installed verified at exactly these versions):\n")
+	for _, dep := range []struct{ name, version string }{
+		{"terraform", download.Terraform.Version},
+		{"helm", download.Helm.Version},
+		{"k3d", download.K3d.Version},
+		{"mkcert", download.Mkcert.Version},
+		{"infracost", download.Infracost.Version + " (optional, cost estimates)"},
+		{"argo-cd", "chart " + argocd.ArgoCDChartVersion},
+	} {
+		fmt.Fprintf(&b, "  %-10s %s\n", dep.name, dep.version)
+	}
+	return strings.TrimRight(b.String(), "\n")
+}
+
 // buildRootCommand constructs the root command with given version info
 func buildRootCommand(versionInfo VersionInfo) *cobra.Command {
 	rootCmd := &cobra.Command{
 		Use:   "openframe",
-		Short: "OpenFrame CLI - Kubernetes cluster bootstrapping and chart deployment",
-		Long: `OpenFrame CLI - Interactive Kubernetes Platform Bootstrapper
+		Short: "OpenFrame CLI - provision Kubernetes clusters and deploy the OpenFrame platform",
+		Long: `OpenFrame CLI - Kubernetes Platform Bootstrapper
 
-OpenFrame CLI replaces the shell scripts with a modern, interactive terminal UI
-for managing OpenFrame Kubernetes deployments. Built following best practices
-for CLI design with wizard-style interactive prompts.
+Provision a Kubernetes cluster — local k3d for development, or cloud GKE/EKS
+via Terraform — install the OpenFrame platform onto it (ArgoCD app-of-apps),
+and manage the full lifecycle: prerequisites, status, upgrades, teardown.
 
-Key Features:
-  - Interactive Wizard - Step-by-step guided setup
-  - Cluster Management - local K3d and cloud GKE / AWS EKS clusters
-  - Helm Integration - App-of-Apps pattern with ArgoCD
-  - Prerequisite Checking - Validates tools before running
+Typical flows:
+  openframe bootstrap                    # local: k3d cluster + platform in one step
+  openframe cluster create --type gke    # cloud: plan, confirm, provision...
+  openframe app install                  # ...then install the platform onto it
 
-The CLI provides both interactive modes for new users and flag-based
-operation for automation and power users.`,
-		Version: fmt.Sprintf("%s (%s) built on %s", versionInfo.Version, versionInfo.Commit, versionInfo.Date),
+Command groups:
+  cluster        create, delete, list, status, use, cleanup (prune node images)
+  app            install, upgrade, status, access, uninstall
+  bootstrap      cluster create + app install in one step
+  prerequisites  check and install required tools (--type k3d|eks|gke)
+  update         update this CLI to a newer release
+
+Every command runs interactively by default (wizards, confirmations) and
+non-interactively with flags for CI and automation. Cloud creates show a full
+terraform plan (and an infracost estimate, when installed) before anything is
+applied; cloud deletes require typed confirmation, destroy the
+terraform-managed resources, and report any leftovers they could not remove.`,
+		// The version MUST stay the first whitespace token: selfupdate's
+		// rollback labels the saved binary by parsing `--version` output that
+		// way (binaryVersion in internal/shared/selfupdate). The toolchain and
+		// platform ride along because they are the first questions of any bug
+		// report about a downloaded release; the pinned-dependency block below
+		// them answers the second ("which terraform/helm/argocd does this build
+		// install?") without digging through the source.
+		Version: fmt.Sprintf("%s (%s) built on %s — %s %s/%s\n\n%s",
+			versionInfo.Version, versionInfo.Commit, versionInfo.Date,
+			runtime.Version(), runtime.GOOS, runtime.GOARCH,
+			pinnedDependencies()),
 		// Silence errors and usage globally - we handle our own error display
 		SilenceErrors: true,
 		SilenceUsage:  true,

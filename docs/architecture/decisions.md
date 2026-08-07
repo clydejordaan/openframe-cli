@@ -52,7 +52,8 @@ The cluster is always a local k3d cluster.
 
 - `openframe cluster create|delete|list|status|cleanup` — cluster lifecycle.
   `create` **only creates the cluster**; it never installs the app. (Verb is
-  `create`; there is no `apply`.) `cleanup` removes unused cluster resources.
+  `create`; there is no `apply`.) `cleanup` only prunes unused container images
+  on the nodes; removing the platform is `app uninstall`'s job.
 - `openframe app install|upgrade|status|access|uninstall` — installs and operates
   the OpenFrame app on an existing, online cluster. `upgrade` re-deploys the
   app-of-apps at a new git ref (`--ref`) or forces an ArgoCD hard refresh + sync
@@ -136,7 +137,8 @@ terraform, that is a different BUSL use profile and needs its own review.
 ## D8 — Local terraform state in per-cluster workspaces
 
 Each cloud cluster owns a workspace under `~/.openframe/clusters/<name>/`:
-the generated root module, `terraform.tfvars.json`, local state, and a
+the generated root module, `terraform.tfvars.json`, local state, a
+`terraform.log` every apply/destroy appends its output stream to, and a
 `cluster.json` registry record (type, status, endpoint/CA). The registry is
 what makes cloud clusters visible to `list`/`status`/`delete` without cloud
 API calls, and the state file is the only pointer to billed resources — so a

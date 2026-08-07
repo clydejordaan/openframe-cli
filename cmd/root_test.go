@@ -5,13 +5,16 @@ import (
 	"io"
 	"os"
 	"path/filepath"
+	"runtime"
 	"runtime/debug"
 	"strings"
 	"testing"
 
 	"github.com/pterm/pterm"
 
+	"github.com/flamingo-stack/openframe-cli/internal/chart/providers/argocd"
 	"github.com/flamingo-stack/openframe-cli/internal/shared/config"
+	"github.com/flamingo-stack/openframe-cli/internal/shared/download"
 	"github.com/flamingo-stack/openframe-cli/internal/shared/ui"
 	"github.com/flamingo-stack/openframe-cli/tests/testutil"
 )
@@ -31,7 +34,7 @@ func TestRootCommand(t *testing.T) {
 		t.Errorf("expected Use to be 'openframe', got %q", cmd.Use)
 	}
 
-	expectedShort := "OpenFrame CLI - Kubernetes cluster bootstrapping and chart deployment"
+	expectedShort := "OpenFrame CLI - provision Kubernetes clusters and deploy the OpenFrame platform"
 	if cmd.Short != expectedShort {
 		t.Errorf("expected Short to be %q, got %q", expectedShort, cmd.Short)
 	}
@@ -111,9 +114,33 @@ func TestGetRootCmd(t *testing.T) {
 		t.Error("Short description should not be empty")
 	}
 
-	expectedVersion := "test-version (test-commit) built on test-date"
-	if cmd.Version != expectedVersion {
-		t.Errorf("expected version %q, got %q", expectedVersion, cmd.Version)
+	// The version must stay the FIRST whitespace token — selfupdate's rollback
+	// labels the saved binary by parsing `--version` output that way — followed
+	// by the commit/date and the toolchain/platform suffix.
+	expectedPrefix := "test-version (test-commit) built on test-date — "
+	if !strings.HasPrefix(cmd.Version, expectedPrefix) {
+		t.Errorf("expected version to start with %q, got %q", expectedPrefix, cmd.Version)
+	}
+	if !strings.Contains(cmd.Version, runtime.GOOS+"/"+runtime.GOARCH) {
+		t.Errorf("expected version to name the platform, got %q", cmd.Version)
+	}
+	// The pinned-dependency block: --version must answer "which
+	// terraform/helm/argocd does this build install" from the single sources
+	// of truth (download pins, argocd chart pin), never hardcoded copies.
+	if !strings.Contains(cmd.Version, runtime.Version()) {
+		t.Errorf("expected version to name the Go toolchain, got %q", cmd.Version)
+	}
+	for _, dep := range []string{
+		"terraform  " + download.Terraform.Version,
+		"helm       " + download.Helm.Version,
+		"k3d        " + download.K3d.Version,
+		"mkcert     " + download.Mkcert.Version,
+		"infracost  " + download.Infracost.Version,
+		"argo-cd    chart " + argocd.ArgoCDChartVersion,
+	} {
+		if !strings.Contains(cmd.Version, dep) {
+			t.Errorf("expected version output to list pinned dependency %q, got:\n%s", dep, cmd.Version)
+		}
 	}
 }
 

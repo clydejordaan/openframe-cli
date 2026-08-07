@@ -1,6 +1,7 @@
 package terraform
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"errors"
@@ -258,4 +259,68 @@ func TestNewEngine_VerboseWrapsRunnerForSelectiveStdout(t *testing.T) {
 	require.NoError(t, err)
 	assert.IsType(t, &tfexec.Terraform{}, quiet,
 		"non-verbose needs no wrapper — stdout is never streamed")
+}
+
+// TestEngine_ApplyWritesOpLog: a long cloud operation must leave a
+// file record, not just terminal scrollback. Apply tees terraform's raw
+// JSON-UI stream into the workspace's terraform.log, and a failure names the
+// log path.
+func TestEngine_ApplyWritesOpLog(t *testing.T) {
+	dir := t.TempDir()
+	stream := `{"@level":"info","@message":"module.gke: Creating...","type":"apply_start"}` + "\n"
+	f := &fakeRunner{applyJSON: stream}
+	e := engineWith(f)
+
+	require.NoError(t, e.Apply(context.Background(), dir))
+
+	logged, err := os.ReadFile(filepath.Join(dir, OpLogName))
+	require.NoError(t, err, "apply must write %s in the workspace dir", OpLogName)
+	assert.Contains(t, string(logged), "=== terraform apply", "each run starts with a header")
+	assert.Contains(t, string(logged), "module.gke: Creating...", "the raw stream is preserved")
+
+	// A second run appends rather than truncates: the log is the workspace's
+	// operation history.
+	require.NoError(t, e.Apply(context.Background(), dir))
+	logged2, err := os.ReadFile(filepath.Join(dir, OpLogName))
+	require.NoError(t, err)
+	assert.Greater(t, len(logged2), len(logged), "runs append, never truncate")
+}
+
+// TestEngine_ApplyFailureNamesTheLog: the error must point at the full record.
+func TestEngine_ApplyFailureNamesTheLog(t *testing.T) {
+	dir := t.TempDir()
+	f := &fakeRunner{apply: errors.New("quota exceeded")}
+	e := engineWith(f)
+
+	err := e.Apply(context.Background(), dir)
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), OpLogName, "the failure must name the log file")
+}
+
+// failingWriter errors on every write, simulating a log file on a filesystem
+// that filled up or vanished after the file was opened.
+type failingWriter struct{ writes int }
+
+func (f *failingWriter) Write(p []byte) (int, error) {
+	f.writes++
+	return 0, errors.New("no space left on device")
+}
+
+// TestBestEffortTee_LogFailureNeverFailsTheRun: a terraform.log write error
+// must not propagate — exec.Cmd would surface it from Wait and report a
+// completed apply as failed. The sink is dropped on first failure; progress
+// keeps flowing.
+func TestBestEffortTee_LogFailureNeverFailsTheRun(t *testing.T) {
+	var progress bytes.Buffer
+	sink := &failingWriter{}
+	tee := &bestEffortTee{progress: &progress, sink: sink}
+
+	n, err := tee.Write([]byte("line 1\n"))
+	require.NoError(t, err, "a log-sink failure must not surface from the tee")
+	assert.Equal(t, len("line 1\n"), n)
+
+	_, err = tee.Write([]byte("line 2\n"))
+	require.NoError(t, err)
+	assert.Equal(t, 1, sink.writes, "the sink is dropped after its first failure, not retried")
+	assert.Equal(t, "line 1\nline 2\n", progress.String(), "progress output continues past the log failure")
 }
